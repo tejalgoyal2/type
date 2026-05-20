@@ -1,0 +1,23 @@
+{
+  "name": "type-tgoyal",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "type.tgoyal.me - a silent page where the text itself has physics",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource-variable/jetbrains-mono": "^5.2.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0"
+  }
+}

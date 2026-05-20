@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Cloudflare / Wrangler local state and secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Environment files (never commit credentials)
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.local
