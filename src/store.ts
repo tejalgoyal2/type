@@ -10,11 +10,14 @@ export interface Odometer {
   bestWpm: number;
 }
 
+import type { StyleId } from "./styles";
+
 export interface Prefs {
   palette: number;
-  finish: "print" | "clean";
+  style: StyleId;
   seismo: boolean;
   caption: boolean;
+  chrome: boolean;
   motion: 0 | 1 | 2; // off | subtle | full
 }
 
@@ -57,13 +60,19 @@ export function saveOdometer(odo: Odometer): void {
   write(ODO_KEY, odo);
 }
 
+const STYLE_IDS: StyleId[] = ["print", "clean", "ember", "tide", "frost", "gale"];
+
 export function loadPrefs(): Prefs {
-  const p = read<Partial<Prefs>>(PREFS_KEY);
+  const p = read<Partial<Prefs> & { finish?: string }>(PREFS_KEY);
+  let style: StyleId = "print";
+  if (p?.style && STYLE_IDS.includes(p.style)) style = p.style;
+  else if (p?.finish === "clean") style = "clean";
   return {
     palette: typeof p?.palette === "number" ? p.palette : 0,
-    finish: p?.finish === "clean" ? "clean" : "print",
+    style,
     seismo: p?.seismo !== false,
     caption: p?.caption !== false,
+    chrome: p?.chrome !== false,
     motion: p?.motion === 0 || p?.motion === 1 ? p.motion : 2
   };
 }
