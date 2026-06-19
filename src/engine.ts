@@ -16,6 +16,7 @@
  * - every keystroke ticks the seismograph in the bottom margin.
  */
 import { PALETTES, mixHex, type Palette } from "./palettes";
+import { styleOf, STYLES, type StyleDef } from "./styles";
 import { Spring, landCurve, clamp, lerp, easeOut } from "./springs";
 import { Rhythm } from "./rhythm";
 import {
@@ -61,6 +62,24 @@ interface Dying {
   w: number;
   at: number;
 }
+
+/**
+ * Particles are analytic: position is computed from age, so updating them
+ * costs nothing and they carry no per-frame state. Hard capped; spawning
+ * past the cap recycles the oldest.
+ */
+interface Particle {
+  kind: "ember" | "ring" | "frost" | "leaf";
+  x0: number;
+  y0: number;
+  vx: number;
+  vy: number;
+  born: number;
+  life: number;
+  seed: number;
+}
+
+const PARTICLE_CAP = 140;
 
 /** Weight a glyph keeps forever, derived from the peak it reached while held. */
 function recordWeight(peak: number): number {
@@ -143,6 +162,7 @@ export class Engine {
   private toastMsg = "";
   private toastAt = -1e9;
   private dotPattern: CanvasPattern | null = null;
+  private particles: Particle[] = [];
 
   private bootAt: number;
   private prev: number;
@@ -189,6 +209,25 @@ export class Engine {
 
   private palette(): Palette {
     return PALETTES[this.prefs.palette % PALETTES.length]!;
+  }
+
+  private style(): StyleDef {
+    return styleOf(this.prefs.style);
+  }
+
+  /**
+   * Effective accent colors: elemental styles bring their own fresh-ink
+   * colors. On light paper they are pulled toward the palette ink so pale
+   * accents (Frost) stay legible.
+   */
+  private fx(p: Palette, sd: StyleDef): { fresh: string; misA: string; misB: string } {
+    if (!sd.accent) return { fresh: p.fresh, misA: p.misA, misB: p.misB };
+    const adapt = (c: string) => (p.dark ? c : mixHex(c, p.ink, 0.32));
+    return {
+      fresh: adapt(sd.accent.fresh),
+      misA: adapt(sd.accent.misA),
+      misB: adapt(sd.accent.misB)
+    };
   }
 
   private motionMul(): number {
@@ -357,13 +396,15 @@ export class Engine {
       case 3:
         this.cyclePalette(1);
         break;
-      case 4:
-        this.prefs.finish = this.prefs.finish === "print" ? "clean" : "print";
-        this.toast(`Finish: ${this.prefs.finish === "print" ? "Print" : "Clean"}`);
+      case 4: {
+        const idx = STYLES.findIndex((s) => s.id === this.prefs.style);
+        this.prefs.style = STYLES[(idx + 1) % STYLES.length]!.id;
+        this.toast(`Style: ${this.style().label}`);
         this.dotPattern = null;
         this.staticDirty = true;
         savePrefs(this.prefs);
         break;
+      }
       case 5:
         this.prefs.seismo = !this.prefs.seismo;
         this.toast(`Seismograph ${this.prefs.seismo ? "on" : "off"}`);
@@ -384,6 +425,11 @@ export class Engine {
       case 8:
         this.statsOpen = !this.statsOpen;
         this.helpOpen = false;
+        break;
+      case 9:
+        this.prefs.chrome = !this.prefs.chrome;
+        this.toast(`Controls strip ${this.prefs.chrome ? "shown" : "hidden"}`);
+        savePrefs(this.prefs);
         break;
       default:
         break;
@@ -417,6 +463,7 @@ export class Engine {
     this.rhythm.record(now);
     this.lastInput = now;
     this.squash.kick(3.2 * this.motionMul());
+    this.spawnFor(this.colX(this.caretIdx - 1), this.typingY - this.fs * 0.35, now, 1);
     this.dirtySheet = true;
   }
 
@@ -450,6 +497,7 @@ export class Engine {
     this.slideFrom = now;
     this.staticDirty = true;
     this.squash.kick(4.2 * this.motionMul());
+    this.spawnFor(this.caretX.x, this.typingY - this.fs * 0.35, now, 2);
     this.dirtySheet = true;
   }
 
@@ -610,15 +658,16 @@ export class Engine {
 
   private draw(now: number): void {
     const p = this.palette();
+    const sd = this.style();
+    const fx = this.fx(p, sd);
     const ctx = this.ctx;
-    const print = this.prefs.finish === "print";
     const mm = this.motionMul();
 
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.fillStyle = p.paper;
     ctx.fillRect(0, 0, this.w, this.h);
 
-    if (print) this.drawHalftoneBands(p);
+    if (sd.halftone) this.drawHalftoneBands(p);
 
     // Settled history (static layer), with the Enter slide.
     if (this.staticDirty) this.rebuildStatic(p, now);
@@ -629,16 +678,18 @@ export class Engine {
     ctx.drawImage(this.staticCanvas, 0, slide * this.dpr);
     ctx.restore();
 
-    this.drawActiveLine(p, now, print, mm);
+    this.drawParticles(fx, now);
+    this.drawActiveLine(p, sd, fx, now, mm);
     this.drawDying(p, now);
-    this.drawCaret(p, now, mm);
-    if (this.prefs.seismo) this.drawSeismo(p, now);
-    this.drawCaption(p, now, print);
-    this.drawHint(p, now);
+    this.drawCaret(p, sd, fx, now, mm);
+    if (this.prefs.seismo) this.drawSeismo(p, fx, now);
+    this.drawCaption(p, sd, fx, now);
+    if (this.prefs.chrome) this.drawChrome(p, sd, now);
+    this.drawWelcome(p, now);
     this.drawToast(p, now);
 
     if (this.wipe) this.drawWipe(now, mm);
-    if (this.helpOpen) this.drawHelp(p);
+    if (this.helpOpen) this.drawHelp(p, sd);
     if (this.statsOpen) this.drawStats(p);
   }
 
@@ -682,38 +733,96 @@ export class Engine {
     }
   }
 
-  private drawActiveLine(p: Palette, now: number, print: boolean, mm: number): void {
+  private drawActiveLine(
+    p: Palette,
+    sd: StyleDef,
+    fx: { fresh: string; misA: string; misB: string },
+    now: number,
+    mm: number
+  ): void {
     const ctx = this.ctx;
     ctx.textBaseline = "alphabetic";
     for (let i = 0; i < this.active.length; i++) {
       const g = this.active[i]!;
       const age = now - g.born;
       const land = mm > 0 ? landCurve(age / LAND_MS) : 1;
-      const yOff = -(1 - land) * this.fs * 0.38 * mm;
+      const settling = land < 0.999 || age < 600;
       const alpha = Math.min(1, age / 45);
       const weight = this.glyphWeight(g, now);
       const dryT = g.upAt === null ? 0 : Math.min(1, (now - g.upAt) / DRY_MS);
       const x = this.colX(i);
-      const y = this.typingY + yOff;
+      let y = this.typingY;
+      let xOff = 0;
+
+      // How this style's glyphs arrive.
+      if (settling && mm > 0) {
+        switch (sd.land) {
+          case "drop":
+            y += -(1 - land) * this.fs * 0.38 * mm;
+            break;
+          case "rise":
+            y += (1 - land) * this.fs * 0.3 * mm;
+            break;
+          case "blow":
+            xOff = (1 - land) * this.advance * 1.6 * mm;
+            break;
+          case "crystal":
+            // handled below with a scale transform
+            break;
+          case "ripple": {
+            const decay = Math.exp(-age / 200);
+            xOff = Math.sin(age / 50) * 3 * decay * mm;
+            break;
+          }
+        }
+      }
 
       ctx.font = this.font(weight);
 
       // Print finish: fresh ink prints out of register, proportional to flow
       // heat, and snaps into register as the glyph settles.
-      if (print && mm > 0) {
+      if (sd.misreg && mm > 0) {
         const mis = this.heat * 2.8 * mm * (1 - Math.min(1, age / 600));
         if (mis > 0.35) {
           ctx.globalAlpha = alpha * 0.55;
-          ctx.fillStyle = p.misA;
+          ctx.fillStyle = fx.misA;
           ctx.fillText(g.ch, x - mis, y + mis * 0.4);
-          ctx.fillStyle = p.misB;
+          ctx.fillStyle = fx.misB;
           ctx.fillText(g.ch, x + mis, y - mis * 0.3);
         }
       }
 
       ctx.globalAlpha = alpha;
-      ctx.fillStyle = dryT >= 1 ? p.ink : mixHex(p.fresh, p.ink, dryT);
-      ctx.fillText(g.ch, x, y);
+      ctx.fillStyle = dryT >= 1 ? p.ink : mixHex(fx.fresh, p.ink, dryT);
+
+      // Elemental styles let very fresh glyphs glow with flow heat.
+      const glowing =
+        sd.glow > 1 && mm > 0 && dryT < 0.5 && this.heat > 0.08 && age < 1500;
+      if (glowing) {
+        ctx.save();
+        ctx.shadowColor = fx.fresh;
+        ctx.shadowBlur = (1 - dryT) * 9 * this.heat * sd.glow * mm;
+      }
+
+      if (sd.land === "crystal" && settling && mm > 0) {
+        const sc = 1 + (1 - land) * 0.22 * mm;
+        ctx.save();
+        ctx.translate(x + xOff + this.advance / 2, y - this.fs * 0.33);
+        ctx.scale(sc, sc);
+        ctx.fillText(g.ch, -this.advance / 2, this.fs * 0.33);
+        ctx.restore();
+      } else if (sd.land === "blow" && settling && mm > 0) {
+        const shear = (1 - land) * 0.32 * mm;
+        ctx.save();
+        ctx.translate(x + xOff, y);
+        ctx.transform(1, 0, -shear, 1, 0, 0);
+        ctx.fillText(g.ch, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.fillText(g.ch, x + xOff, y);
+      }
+
+      if (glowing) ctx.restore();
     }
     ctx.globalAlpha = 1;
   }
@@ -731,7 +840,158 @@ export class Engine {
     ctx.globalAlpha = 1;
   }
 
-  private drawCaret(p: Palette, now: number, mm: number): void {
+  /**
+   * Spawn particles for the active style at a keystroke. Count scales with
+   * flow heat and the motion preference, so slow deliberate typing sheds
+   * almost nothing and full flow visibly burns/splashes/drifts.
+   */
+  private spawnFor(x: number, y: number, now: number, base: number): void {
+    const sd = this.style();
+    if (!sd.particles) return;
+    const mm = this.motionMul();
+    if (mm === 0) return;
+
+    let count: number;
+    switch (sd.particles) {
+      case "ember":
+        count = Math.round((base + this.heat * 2.5) * mm);
+        break;
+      case "ring":
+        count = 1;
+        break;
+      case "frost":
+        count = Math.round((base + this.heat * 1.5) * mm);
+        break;
+      case "leaf":
+        count = this.heat > 0.15 ? Math.round(base * mm) : 0;
+        break;
+    }
+
+    for (let i = 0; i < count; i++) {
+      const seed = Math.random();
+      let pt: Particle;
+      switch (sd.particles) {
+        case "ember":
+          pt = {
+            kind: "ember",
+            x0: x + (seed - 0.5) * this.advance,
+            y0: y,
+            vx: (Math.random() - 0.5) * 34,
+            vy: -(38 + Math.random() * 60),
+            born: now,
+            life: 600 + Math.random() * 550,
+            seed
+          };
+          break;
+        case "ring":
+          pt = {
+            kind: "ring",
+            x0: x + this.advance * 0.5,
+            y0: this.typingY + 3,
+            vx: 0,
+            vy: 0,
+            born: now,
+            life: 650,
+            seed
+          };
+          break;
+        case "frost":
+          pt = {
+            kind: "frost",
+            x0: x + (seed - 0.5) * this.advance * 1.4,
+            y0: y - this.fs * 0.4,
+            vx: (Math.random() - 0.5) * 14,
+            vy: 9 + Math.random() * 16,
+            born: now,
+            life: 1000 + Math.random() * 700,
+            seed
+          };
+          break;
+        case "leaf":
+          pt = {
+            kind: "leaf",
+            x0: x,
+            y0: y - this.fs * (0.2 + seed * 0.6),
+            vx: 55 + Math.random() * 70,
+            vy: 0,
+            born: now,
+            life: 900 + Math.random() * 600,
+            seed
+          };
+          break;
+      }
+      if (this.particles.length >= PARTICLE_CAP) this.particles.shift();
+      this.particles.push(pt);
+    }
+  }
+
+  private drawParticles(
+    fx: { fresh: string; misA: string; misB: string },
+    now: number
+  ): void {
+    if (this.particles.length === 0) return;
+    const ctx = this.ctx;
+    this.particles = this.particles.filter((pt) => now - pt.born < pt.life);
+    for (const pt of this.particles) {
+      const age = now - pt.born;
+      const t = age / pt.life;
+      const s = age / 1000;
+      switch (pt.kind) {
+        case "ember": {
+          const x = pt.x0 + pt.vx * s + Math.sin(pt.seed * 9 + age / 160) * 3;
+          const y = pt.y0 + pt.vy * s - 26 * s * s;
+          ctx.globalAlpha = (1 - t) * 0.85;
+          ctx.fillStyle = t < 0.35 ? fx.misA : fx.fresh;
+          ctx.beginPath();
+          ctx.arc(x, y, Math.max(0.6, 2.2 * (1 - t * 0.6)), 0, Math.PI * 2);
+          ctx.fill();
+          break;
+        }
+        case "ring": {
+          const r = 3 + 17 * easeOut(t);
+          ctx.globalAlpha = (1 - t) * 0.45;
+          ctx.strokeStyle = fx.fresh;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.ellipse(pt.x0, pt.y0, r, r * 0.34, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          break;
+        }
+        case "frost": {
+          const x = pt.x0 + pt.vx * s + Math.sin(pt.seed * 6 + age / 280) * 3.5;
+          const y = pt.y0 + pt.vy * s;
+          const tw = 0.5 + 0.5 * Math.sin(age / 90 + pt.seed * 9);
+          ctx.globalAlpha = (1 - t) * tw * 0.9;
+          ctx.fillStyle = fx.misA;
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate(Math.PI / 4);
+          ctx.fillRect(-1.1, -1.1, 2.2, 2.2);
+          ctx.restore();
+          break;
+        }
+        case "leaf": {
+          const x = pt.x0 + pt.vx * s;
+          const y = pt.y0 + Math.sin(age / 230 + pt.seed * 7) * 6 + 12 * s;
+          ctx.globalAlpha = (1 - t) * 0.65;
+          ctx.fillStyle = fx.fresh;
+          ctx.beginPath();
+          ctx.ellipse(x, y, 2.6, 1.1, pt.seed * 3 + age / 500, 0, Math.PI * 2);
+          ctx.fill();
+          break;
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  private drawCaret(
+    p: Palette,
+    sd: StyleDef,
+    fx: { fresh: string; misA: string; misB: string },
+    now: number,
+    mm: number
+  ): void {
     const ctx = this.ctx;
     const idle = now - this.lastInput;
     const blink = idle > 1200 ? 0.35 + 0.65 * Math.abs(Math.sin((now - 1200) / 480)) : 1;
@@ -746,17 +1006,21 @@ export class Engine {
     ctx.transform(1, 0, -lean, 1, 0, 0);
     ctx.scale(1, sy);
     if (this.heat > 0.05 && mm > 0) {
-      ctx.shadowColor = p.fresh;
-      ctx.shadowBlur = 18 * this.heat * mm;
+      ctx.shadowColor = fx.fresh;
+      ctx.shadowBlur = 18 * this.heat * sd.glow * mm;
     }
     ctx.globalAlpha = blink;
-    ctx.fillStyle = this.shiftHeld ? p.fresh : p.ink;
+    ctx.fillStyle = this.shiftHeld ? fx.fresh : p.ink;
     ctx.fillRect(0, -chh, cw, chh);
     ctx.restore();
     ctx.globalAlpha = 1;
   }
 
-  private drawSeismo(p: Palette, now: number): void {
+  private drawSeismo(
+    p: Palette,
+    fx: { fresh: string; misA: string; misB: string },
+    now: number
+  ): void {
     const ctx = this.ctx;
     const yMid = this.h - 30;
     const left = this.marginX;
@@ -780,7 +1044,7 @@ export class Engine {
       const gap = i > 0 ? t - ticks[i - 1]! : 400;
       const hgt = clamp(1400 / Math.max(gap, 40), 3, 18);
       const recent = clamp(1 - (now - t) / SEISMO_SPAN, 0, 1);
-      ctx.strokeStyle = this.heat > 0.2 && now - t < 1500 ? p.fresh : p.sub;
+      ctx.strokeStyle = this.heat > 0.2 && now - t < 1500 ? fx.fresh : p.sub;
       ctx.globalAlpha = 0.25 + 0.55 * recent;
       ctx.beginPath();
       ctx.moveTo(x, yMid - hgt);
@@ -792,11 +1056,18 @@ export class Engine {
 
   private captionA = 0;
 
-  private drawCaption(p: Palette, now: number, print: boolean): void {
+  private drawCaption(
+    p: Palette,
+    sd: StyleDef,
+    fx: { fresh: string; misA: string; misB: string },
+    now: number
+  ): void {
     const flowOn =
       this.prefs.caption && this.heat > 0.12 && this.emaWpm > 38 && now - this.lastInput < 900;
     this.captionA += ((flowOn ? 1 : 0) - this.captionA) * 0.12;
     if (this.captionA < 0.02) return;
+    const print = sd.id === "print";
+    void fx;
 
     const ctx = this.ctx;
     const fsC = Math.round(this.fs * 0.78);
@@ -844,18 +1115,67 @@ export class Engine {
     ctx.textBaseline = "alphabetic";
   }
 
-  private drawHint(p: Palette, now: number): void {
+  /**
+   * The empty sheet explains itself. Shown only when nothing has been
+   * typed; fades from view forever the moment there is text.
+   */
+  private drawWelcome(p: Palette, now: number): void {
     if (this.baked.length || this.active.length || this.helpOpen || this.statsOpen) return;
-    if (now - this.bootAt < 800) return;
+    if (now - this.bootAt < 600) return;
     const ctx = this.ctx;
-    const pulse = 0.45 + 0.12 * Math.sin(now / 900);
+    const x = this.marginX;
+    const small = Math.round(this.fs * 0.62);
+    const titleSize = Math.round(this.fs * 1.55);
+    let y = Math.max(96, this.typingY - this.lineHeight * 4.6);
+
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = p.ink;
+    ctx.font = this.font(760, titleSize);
+    ctx.fillText("type", x, y);
+    y += small * 2.1;
+
+    ctx.font = this.font(460, small);
+    ctx.fillStyle = p.ink;
+    ctx.globalAlpha = 0.75;
+    ctx.fillText("a quiet page that makes typing feel good.", x, y);
+    y += small * 1.7;
+    ctx.fillText("no test, no timer, no sound. just your words, with physics.", x, y);
+    y += small * 2.4;
+
+    const pulse = 0.55 + 0.15 * Math.sin(now / 900);
     ctx.globalAlpha = pulse;
     ctx.fillStyle = p.sub;
-    ctx.font = this.font(460, Math.round(this.fs * 0.62));
-    ctx.fillText("type anywhere", this.marginX, this.typingY - this.lineHeight * 1.6);
-    ctx.globalAlpha = pulse * 0.8;
-    ctx.font = this.font(430, Math.round(this.fs * 0.5));
-    ctx.fillText("F1 help", this.marginX, this.typingY - this.lineHeight * 1.6 + this.fs * 0.95);
+    ctx.font = this.font(440, Math.round(small * 0.92));
+    ctx.fillText("start typing, anywhere on this page", x, y);
+    y += small * 1.55;
+    ctx.fillText("hold a key down and it prints heavier. the page remembers.", x, y);
+    y += small * 1.55;
+    ctx.fillStyle = p.fresh;
+    ctx.fillText("press F1 for everything else", x, y);
+    ctx.globalAlpha = 1;
+  }
+
+  /**
+   * Always-visible control strip, top left. Quiet by design: it dims while
+   * you are in flow so it never competes with the text, and F9 hides it
+   * entirely.
+   */
+  private drawChrome(p: Palette, sd: StyleDef, now: number): void {
+    if (this.helpOpen || this.statsOpen) return;
+    const ctx = this.ctx;
+    const small = Math.round(this.fs * 0.46);
+    const idleFor = now - this.lastInput;
+    const a = this.heat > 0.25 ? 0.14 : idleFor > 4000 ? 0.62 : 0.4;
+
+    ctx.font = this.font(460, small);
+    const status = `${this.palette().label} · ${sd.label}`;
+    const controls = "F1 help   F2/F3 palette   F4 style   Esc clear";
+
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.sub;
+    ctx.fillText(status, this.marginX, 34);
+    ctx.globalAlpha = a * 0.85;
+    ctx.fillText(controls, this.marginX, 34 + small * 1.5);
     ctx.globalAlpha = 1;
   }
 
@@ -924,47 +1244,90 @@ export class Engine {
     return { x: (this.w - pw) / 2, y: Math.max(56, this.h * 0.14), pw };
   }
 
-  private drawHelp(p: Palette): void {
+  private drawHelp(p: Palette, sd: StyleDef): void {
     const ctx = this.ctx;
-    const { x, y } = this.overlayPanel(p);
-    const small = Math.round(this.fs * 0.6);
-    let cy = y;
-
-    ctx.fillStyle = p.ink;
-    ctx.font = this.font(760, Math.round(this.fs * 1.5));
-    ctx.fillText("type", x, cy);
-    ctx.font = this.font(440, small);
-    ctx.fillStyle = p.sub;
-    ctx.fillText("a place to press keys. no test, no timer, no judging.", x, cy + small * 1.6);
-    cy += small * 4.2;
+    ctx.fillStyle = p.paper;
+    ctx.globalAlpha = 0.96;
+    ctx.fillRect(0, 0, this.w, this.h);
+    ctx.globalAlpha = 1;
 
     const rows: Array<[string, string]> = [
-      ["F1", "this help"],
-      ["F2 / F3", `palette: ${this.palette().label}`],
-      ["F4", `finish: ${this.prefs.finish === "print" ? "Print" : "Clean"}`],
-      ["F5", `seismograph: ${this.prefs.seismo ? "on" : "off"}`],
-      ["F6", `flow caption: ${this.prefs.caption ? "on" : "off"}`],
+      ["F1", "open and close this help"],
+      ["F2 / F3", `palette, now ${this.palette().label}`],
+      ["F4", `style, now ${sd.label}`],
+      ["F5", `seismograph ${this.prefs.seismo ? "(on)" : "(off)"}`],
+      ["F6", `flow caption ${this.prefs.caption ? "(on)" : "(off)"}`],
       ["F7", `motion: ${["off", "subtle", "full"][this.prefs.motion]}`],
-      ["F8", "odometer and stats"],
-      ["Esc", "clear the sheet"],
-      ["Ctrl+Z", "bring it back"],
+      ["F8", "keystroke odometer"],
+      ["F9", `controls strip ${this.prefs.chrome ? "(shown)" : "(hidden)"}`],
+      ["Esc", "clear the page"],
+      ["Ctrl+Z", "bring back what you cleared"],
       ["Ctrl+C", "copy everything you typed"]
     ];
-    const rowH = small * 1.95;
-    for (const [k, desc] of rows) {
-      ctx.font = this.font(660, small);
-      ctx.fillStyle = p.fresh;
-      ctx.fillText(k, x, cy);
-      ctx.font = this.font(440, small);
-      ctx.fillStyle = p.ink;
-      ctx.fillText(desc, x + small * 8, cy);
-      cy += rowH;
-    }
 
-    cy += small * 1.2;
-    ctx.fillStyle = p.sub;
-    ctx.font = this.font(430, Math.round(small * 0.88));
-    ctx.fillText("hold keys and they print heavier. the page remembers.", x, cy);
+    // Adaptive type size so the whole card always fits the viewport.
+    const lineCount = rows.length + 11;
+    let small = Math.round(this.fs * 0.66);
+    small = Math.min(small, Math.floor((this.h * 0.86) / (lineCount * 1.85)));
+    small = Math.max(small, 11);
+    const rowH = Math.round(small * 1.85);
+
+    const pw = Math.min(680, this.w - 64);
+    const ph = rowH * lineCount + small * 3;
+    const px = (this.w - pw) / 2;
+    const py = Math.max(28, (this.h - ph) / 2);
+
+    // Card with the Print treatment: offset slab, then panel, then border.
+    ctx.fillStyle = p.ink;
+    ctx.globalAlpha = 0.9;
+    ctx.fillRect(px + 6, py + 7, pw, ph);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = p.paper;
+    ctx.fillRect(px, py, pw, ph);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = p.ink;
+    ctx.strokeRect(px, py, pw, ph);
+
+    const x = px + small * 2.2;
+    let y = py + small * 3;
+    const section = (title: string) => {
+      ctx.font = this.font(700, Math.round(small * 0.82));
+      ctx.fillStyle = p.fresh;
+      ctx.fillText(title.toUpperCase(), x, y);
+      y += rowH;
+    };
+    const body = (text: string, color = p.ink, weight = 460) => {
+      ctx.font = this.font(weight, small);
+      ctx.fillStyle = color;
+      ctx.fillText(text, x, y);
+      y += rowH;
+    };
+
+    ctx.font = this.font(760, Math.round(small * 1.7));
+    ctx.fillStyle = p.ink;
+    ctx.fillText("type", x, y);
+    y += rowH * 1.4;
+
+    section("what this is");
+    body("a silent typing playground. the page listens to your keyboard");
+    body("and turns your rhythm into motion. nothing is being tested.");
+    y += rowH * 0.5;
+
+    section("controls");
+    for (const [k, desc] of rows) {
+      ctx.font = this.font(680, small);
+      ctx.fillStyle = p.fresh;
+      ctx.fillText(k, x, y);
+      ctx.font = this.font(460, small);
+      ctx.fillStyle = p.ink;
+      ctx.fillText(desc, x + small * 7, y);
+      y += rowH;
+    }
+    y += rowH * 0.5;
+
+    section("how the ink works");
+    body("tap a key and it prints light. hold it and it prints heavier.", p.ink);
+    body("type fast and steady, and the ink reacts to your flow.", p.ink);
   }
 
   private drawStats(p: Palette): void {
