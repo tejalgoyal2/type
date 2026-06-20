@@ -15,10 +15,19 @@ the instrument, the page just listens.
 - The caret is alive. It compresses on each keystroke, leans into speed,
   glows when you are in flow, and sweeps back on Enter like a carriage
   return.
-- Print finish: fresh ink prints slightly out of register while you are
-  typing fast and snaps into registration as it dries. A comic-style caption
-  shows your WPM only during sustained flow, then gets out of the way.
+- Six styles, cycled with F4. Print (the default): fresh ink prints
+  slightly out of register while you are typing fast and snaps into
+  registration as it dries. Clean: just the physics. Then four elemental
+  styles where keystrokes shed matter proportional to your flow: Ember
+  (letters land hot, sparks rise, ink cools as it dries), Tide (letters
+  ripple in, rings spread from each landing), Frost (letters crystallize,
+  flecks drift down), and Gale (letters blow in with speed lines of wind).
+  Nothing is a canned animation; everything scales with your rhythm.
+- A comic-style caption shows your WPM only during sustained flow, then
+  gets out of the way.
 - A seismograph in the bottom margin traces your last 12 seconds of rhythm.
+- A quiet controls strip sits top-left so the basics are always one glance
+  away. It dims while you type and F9 hides it entirely.
 - Backspace has momentum: hold it and deletion accelerates.
 - An odometer (F8) counts lifetime keystrokes, your most-pressed keys, and
   your best flow. Stored locally in your browser; nothing leaves the page.
@@ -30,18 +39,19 @@ the instrument, the page just listens.
 Everything is keyboard-driven. There is no menu and the mouse is never
 needed.
 
-| Key      | Action                          |
-| -------- | ------------------------------- |
-| F1       | Help                            |
-| F2 / F3  | Previous / next palette         |
-| F4       | Finish: Print / Clean           |
-| F5       | Seismograph on/off              |
-| F6       | Flow caption on/off             |
-| F7       | Motion: full / subtle / off     |
-| F8       | Odometer and stats              |
-| Esc      | Clear the sheet                 |
-| Ctrl+Z   | Restore the cleared sheet       |
-| Ctrl+C   | Copy everything you typed       |
+| Key      | Action                                              |
+| -------- | --------------------------------------------------- |
+| F1       | Help: what this is and every control                 |
+| F2 / F3  | Previous / next palette                              |
+| F4       | Cycle style: Print, Clean, Ember, Tide, Frost, Gale  |
+| F5       | Seismograph on/off                                   |
+| F6       | Flow caption on/off                                  |
+| F7       | Motion: full / subtle / off                          |
+| F8       | Odometer and stats                                   |
+| F9       | Controls strip show/hide                             |
+| Esc      | Clear the sheet                                      |
+| Ctrl+Z   | Restore the cleared sheet                            |
+| Ctrl+C   | Copy everything you typed                            |
 
 F11 (browser fullscreen) is left to the browser on purpose; it makes the
 page better. Motion defaults to "subtle" if your OS asks for reduced motion.
