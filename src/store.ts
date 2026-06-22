@@ -8,6 +8,7 @@ export interface Odometer {
   total: number;
   perKey: Record<string, number>;
   bestWpm: number;
+  bestStreak: number;
 }
 
 import type { StyleId } from "./styles";
@@ -53,7 +54,13 @@ function write(key: string, value: unknown): void {
 }
 
 export function loadOdometer(): Odometer {
-  return read<Odometer>(ODO_KEY) ?? { total: 0, perKey: {}, bestWpm: 0 };
+  const o = read<Partial<Odometer>>(ODO_KEY);
+  return {
+    total: typeof o?.total === "number" ? o.total : 0,
+    perKey: o?.perKey && typeof o.perKey === "object" ? o.perKey : {},
+    bestWpm: typeof o?.bestWpm === "number" ? o.bestWpm : 0,
+    bestStreak: typeof o?.bestStreak === "number" ? o.bestStreak : 0
+  };
 }
 
 export function saveOdometer(odo: Odometer): void {
