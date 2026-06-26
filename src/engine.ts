@@ -49,7 +49,22 @@ interface Glyph {
   code: string;
   cap: boolean;
   peak: number;
+  /** Set when a deliberate hold is released: the letter stamps down. */
+  stampAt: number | null;
 }
+
+/** Letterform-shaped shockwave fired by a stamp. */
+interface Stamp {
+  ch: string;
+  x: number;
+  w: number;
+  at: number;
+  power: number; // 0..1, from hold duration
+}
+
+const STAMP_HOLD_MS = 280;
+const STREAK_GAP_MS = 2500;
+const STREAK_MILESTONES = [50, 100, 250, 500, 1000, 2000, 5000];
 
 interface BakedGlyph {
   ch: string;
@@ -134,8 +149,20 @@ export class Engine {
   // Motion state
   private caretX: Spring;
   private squash: Spring;
+  /** The page itself has mass: keystrokes kick it, this spring settles it. */
+  private impact: Spring;
+  private captionPunch: Spring;
   private slideFrom = -1e9;
   private wipe: { canvas: HTMLCanvasElement; at: number } | null = null;
+  private stamps: Stamp[] = [];
+
+  // Streaks: consecutive content keys without backspace or a long pause.
+  private streak = 0;
+  private lastContentAt = -1e9;
+  private captionOverride: { text: string; until: number } | null = null;
+  private seismoFlashAt = -1e9;
+  private bestAtBoot = 0;
+  private celebratedBest = false;
 
   // Signals
   private rhythm = new Rhythm();
@@ -188,6 +215,9 @@ export class Engine {
 
     this.caretX = new Spring(0, 620, 34);
     this.squash = new Spring(0, 320, 17);
+    this.impact = new Spring(0, 380, 26);
+    this.captionPunch = new Spring(0, 300, 16);
+    this.bestAtBoot = this.odo.bestWpm;
 
     this.resize();
     window.addEventListener("resize", () => this.resize());
@@ -379,8 +409,28 @@ export class Engine {
     const now = performance.now();
     if (e.key === "Shift") this.shiftHeld = false;
     if (e.key === "Backspace") this.bsHeld = false;
-    for (const g of this.active) {
-      if (g.code === e.code && g.upAt === null) g.upAt = now;
+    for (let i = 0; i < this.active.length; i++) {
+      const g = this.active[i]!;
+      if (g.code === e.code && g.upAt === null) {
+        g.upAt = now;
+        // The stamp: a deliberate hold released is the payoff of the
+        // pressure system. The letter pulses, fires a letterform-shaped
+        // shockwave, and thumps the page in proportion to the hold.
+        const hold = now - g.born;
+        if (hold >= STAMP_HOLD_MS && g.ch !== " " && this.motionMul() > 0) {
+          const power = Math.min(1, (hold - STAMP_HOLD_MS) / 900);
+          g.stampAt = now;
+          this.stamps.push({
+            ch: g.ch,
+            x: this.colX(i),
+            w: this.glyphWeight(g, now),
+            at: now,
+            power
+          });
+          if (this.stamps.length > 24) this.stamps.shift();
+          this.impact.kick((40 + power * 130) * this.motionMul());
+        }
+      }
     }
   }
 
@@ -449,6 +499,7 @@ export class Engine {
   // ------------------------------------------------------------- edits
 
   private insertChar(ch: string, code: string, now: number): void {
+    if (ch === " ") this.checkSecretWord(now);
     if (this.active.length >= this.maxCols) this.commitLine(now);
     const g: Glyph = {
       ch,
@@ -456,18 +507,44 @@ export class Engine {
       upAt: null,
       code,
       cap: ch >= "A" && ch <= "Z",
-      peak: BASE_W
+      peak: BASE_W,
+      stampAt: null
     };
     this.active.splice(this.caretIdx, 0, g);
     this.caretIdx += 1;
     this.rhythm.record(now);
     this.lastInput = now;
     this.squash.kick(3.2 * this.motionMul());
+    this.impact.kick(12 * this.motionMul());
+    this.bumpStreak(now);
     this.spawnFor(this.colX(this.caretIdx - 1), this.typingY - this.fs * 0.35, now, 1);
     this.dirtySheet = true;
   }
 
+  /** Streak bookkeeping plus milestone celebrations. */
+  private bumpStreak(now: number): void {
+    if (now - this.lastContentAt > STREAK_GAP_MS) this.streak = 0;
+    this.lastContentAt = now;
+    this.streak += 1;
+    if (this.streak > this.odo.bestStreak) {
+      this.odo.bestStreak = this.streak;
+      this.dirtyOdo = true;
+    }
+    if (STREAK_MILESTONES.includes(this.streak)) {
+      this.celebrate(`STREAK ${this.streak}`, now);
+    }
+  }
+
+  /** A caption slam, a page thump, and a seismograph flash. Silent fireworks. */
+  private celebrate(text: string, now: number): void {
+    this.captionOverride = { text, until: now + 2300 };
+    this.captionPunch.kick(6);
+    this.impact.kick(80 * this.motionMul());
+    this.seismoFlashAt = now;
+  }
+
   private backspaceOnce(now: number): void {
+    this.streak = 0;
     if (this.caretIdx > 0) {
       const idx = this.caretIdx - 1;
       const g = this.active[idx]!;
@@ -475,6 +552,7 @@ export class Engine {
       this.active.splice(idx, 1);
       this.caretIdx -= 1;
       this.squash.kick(-2.6 * this.motionMul());
+      this.impact.kick(-14 * this.motionMul());
       this.lastInput = now;
       this.dirtySheet = true;
     } else if (this.baked.length > 0) {
@@ -485,6 +563,7 @@ export class Engine {
   }
 
   private commitLine(now: number): void {
+    this.checkSecretWord(now);
     const line: BakedGlyph[] = this.active.map((g) => ({
       ch: g.ch,
       w: Math.round(recordWeight(g.peak))
@@ -497,8 +576,73 @@ export class Engine {
     this.slideFrom = now;
     this.staticDirty = true;
     this.squash.kick(4.2 * this.motionMul());
+    this.impact.kick(85 * this.motionMul());
+    this.bumpStreak(now);
     this.spawnFor(this.caretX.x, this.typingY - this.fs * 0.35, now, 2);
     this.dirtySheet = true;
+  }
+
+  /**
+   * The page listens for words. Typing a style's name (or its element:
+   * fire, water, ice, wind) switches to it mid-sentence; palettes answer
+   * to their names; "zen" hides all chrome. Checked at word boundaries
+   * (space or Enter), reading the letters just behind the caret.
+   */
+  private checkSecretWord(now: number): void {
+    let word = "";
+    for (let i = this.caretIdx - 1; i >= 0 && word.length < 12; i--) {
+      const c = this.active[i]!.ch;
+      if (!/[a-zA-Z]/.test(c)) break;
+      word = c.toLowerCase() + word;
+    }
+    if (word.length < 3) return;
+
+    const styleAlias: Record<string, string> = {
+      fire: "ember",
+      ember: "ember",
+      water: "tide",
+      tide: "tide",
+      ice: "frost",
+      frost: "frost",
+      wind: "gale",
+      gale: "gale",
+      ink: "print",
+      print: "print",
+      plain: "clean",
+      clean: "clean"
+    };
+
+    const styleId = styleAlias[word];
+    if (styleId && styleId !== this.prefs.style) {
+      this.prefs.style = styleId as Prefs["style"];
+      this.dotPattern = null;
+      this.staticDirty = true;
+      this.toast(`You typed it. Style: ${this.style().label}`);
+      this.impact.kick(60 * this.motionMul());
+      savePrefs(this.prefs);
+      return;
+    }
+
+    const palIdx = PALETTES.findIndex((p) => p.id === word);
+    if (palIdx >= 0 && palIdx !== this.prefs.palette) {
+      this.prefs.palette = palIdx;
+      document.body.style.background = this.palette().paper;
+      this.dotPattern = null;
+      this.staticDirty = true;
+      this.toast(`You typed it. Palette: ${this.palette().label}`);
+      savePrefs(this.prefs);
+      return;
+    }
+
+    if (word === "zen") {
+      const anyOn = this.prefs.chrome || this.prefs.seismo || this.prefs.caption;
+      this.prefs.chrome = !anyOn;
+      this.prefs.seismo = !anyOn;
+      this.prefs.caption = !anyOn;
+      this.toast(anyOn ? "zen" : "welcome back");
+      savePrefs(this.prefs);
+    }
+    void now;
   }
 
   private unEnter(now: number): void {
@@ -509,7 +653,8 @@ export class Engine {
       upAt: now - 60000,
       code: "",
       cap: false,
-      peak: peakFromRecord(bg.w)
+      peak: peakFromRecord(bg.w),
+      stampAt: null
     }));
     this.caretIdx = this.active.length;
     this.caretX.set(this.colX(this.caretIdx));
@@ -578,7 +723,8 @@ export class Engine {
       upAt: now - 60000,
       code: "",
       cap: false,
-      peak: peakFromRecord(g.w)
+      peak: peakFromRecord(g.w),
+      stampAt: null
     }));
     this.caretIdx = this.active.length;
   }
@@ -615,6 +761,10 @@ export class Engine {
     if (flow.active && Math.round(this.emaWpm) > this.odo.bestWpm) {
       this.odo.bestWpm = Math.round(this.emaWpm);
       this.dirtyOdo = true;
+      if (!this.celebratedBest && this.bestAtBoot >= 40) {
+        this.celebratedBest = true;
+        this.celebrate(`NEW BEST ${this.odo.bestWpm} WPM`, t);
+      }
     }
 
     // Our own accelerating backspace repeat.
@@ -634,6 +784,10 @@ export class Engine {
     this.caretX.update(dt);
     this.squash.target = 0;
     this.squash.update(dt);
+    this.impact.target = 0;
+    this.impact.update(dt);
+    this.captionPunch.target = 0;
+    this.captionPunch.update(dt);
 
     this.persist(false);
     this.draw(t);
@@ -667,6 +821,12 @@ export class Engine {
     ctx.fillStyle = p.paper;
     ctx.fillRect(0, 0, this.w, this.h);
 
+    // The page has mass: the whole world rides the impact spring.
+    // 0.42 maps spring units to px: a character lands ~0.25 px, Enter
+    // ~1.8 px, a full-power stamp ~3.5 px, clamped at 4.
+    const pageY = clamp(this.impact.x * 0.42, -4, 4) * mm;
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, pageY * this.dpr);
+
     if (sd.halftone) this.drawHalftoneBands(p);
 
     // Settled history (static layer), with the Enter slide.
@@ -675,11 +835,12 @@ export class Engine {
     const slide = (1 - easeOut(slideT)) * this.lineHeight * mm;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.drawImage(this.staticCanvas, 0, slide * this.dpr);
+    ctx.drawImage(this.staticCanvas, 0, (slide + pageY) * this.dpr);
     ctx.restore();
 
     this.drawParticles(fx, now);
     this.drawActiveLine(p, sd, fx, now, mm);
+    this.drawStamps(fx, now, mm);
     this.drawDying(p, now);
     this.drawCaret(p, sd, fx, now, mm);
     if (this.prefs.seismo) this.drawSeismo(p, fx, now);
@@ -795,6 +956,13 @@ export class Engine {
       ctx.globalAlpha = alpha;
       ctx.fillStyle = dryT >= 1 ? p.ink : mixHex(fx.fresh, p.ink, dryT);
 
+      // A freshly stamped letter pulses down into the page.
+      let stampScale = 1;
+      if (g.stampAt !== null && mm > 0) {
+        const st = (now - g.stampAt) / 160;
+        if (st < 1) stampScale = 1 + 0.18 * (1 - easeOut(st)) * mm;
+      }
+
       // Elemental styles let very fresh glyphs glow with flow heat.
       const glowing =
         sd.glow > 1 && mm > 0 && dryT < 0.5 && this.heat > 0.08 && age < 1500;
@@ -804,7 +972,13 @@ export class Engine {
         ctx.shadowBlur = (1 - dryT) * 9 * this.heat * sd.glow * mm;
       }
 
-      if (sd.land === "crystal" && settling && mm > 0) {
+      if (stampScale > 1.001) {
+        ctx.save();
+        ctx.translate(x + xOff + this.advance / 2, y - this.fs * 0.33);
+        ctx.scale(stampScale, stampScale);
+        ctx.fillText(g.ch, -this.advance / 2, this.fs * 0.33);
+        ctx.restore();
+      } else if (sd.land === "crystal" && settling && mm > 0) {
         const sc = 1 + (1 - land) * 0.22 * mm;
         ctx.save();
         ctx.translate(x + xOff + this.advance / 2, y - this.fs * 0.33);
@@ -836,6 +1010,35 @@ export class Engine {
       ctx.font = this.font(d.w);
       ctx.fillStyle = p.fresh;
       ctx.fillText(d.ch, d.x + t * this.advance * 0.35, this.typingY + t * 3);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /**
+   * Stamp shockwaves: the released letter's own outline expands and fades.
+   * The shockwave is the letterform, not a generic ring; the word stays
+   * the hero even at maximum impact.
+   */
+  private drawStamps(
+    fx: { fresh: string; misA: string; misB: string },
+    now: number,
+    mm: number
+  ): void {
+    if (this.stamps.length === 0 || mm === 0) return;
+    const ctx = this.ctx;
+    this.stamps = this.stamps.filter((s) => now - s.at < 340);
+    for (const s of this.stamps) {
+      const t = (now - s.at) / 340;
+      const sc = 1 + (0.7 + s.power * 0.9) * easeOut(t) * mm;
+      ctx.globalAlpha = (1 - t) * (0.3 + s.power * 0.25);
+      ctx.font = this.font(s.w);
+      ctx.strokeStyle = fx.fresh;
+      ctx.lineWidth = 1.1;
+      ctx.save();
+      ctx.translate(s.x + this.advance / 2, this.typingY - this.fs * 0.33);
+      ctx.scale(sc, sc);
+      ctx.strokeText(s.ch, -this.advance / 2, this.fs * 0.33);
+      ctx.restore();
     }
     ctx.globalAlpha = 1;
   }
@@ -1009,6 +1212,15 @@ export class Engine {
       ctx.shadowColor = fx.fresh;
       ctx.shadowBlur = 18 * this.heat * sd.glow * mm;
     }
+    // Speed smear: ghost carets trail behind fast movement.
+    if (Math.abs(this.caretX.v) > 600 && mm > 0) {
+      const smear = clamp(this.caretX.v * 0.014, -this.advance * 2, this.advance * 2);
+      ctx.globalAlpha = blink * 0.14;
+      ctx.fillStyle = fx.fresh;
+      ctx.fillRect(-smear, -chh, cw, chh);
+      ctx.globalAlpha = blink * 0.07;
+      ctx.fillRect(-smear * 1.8, -chh, cw, chh);
+    }
     ctx.globalAlpha = blink;
     ctx.fillStyle = this.shiftHeld ? fx.fresh : p.ink;
     ctx.fillRect(0, -chh, cw, chh);
@@ -1034,6 +1246,18 @@ export class Engine {
     ctx.moveTo(left, yMid + 0.5);
     ctx.lineTo(right, yMid + 0.5);
     ctx.stroke();
+
+    // Milestone flash: the whole baseline lights up for a beat.
+    const flashT = (now - this.seismoFlashAt) / 450;
+    if (flashT < 1) {
+      ctx.strokeStyle = fx.fresh;
+      ctx.globalAlpha = (1 - flashT) * 0.85;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(left, yMid + 0.5);
+      ctx.lineTo(right, yMid + 0.5);
+      ctx.stroke();
+    }
 
     const ticks = this.rhythm.ticks(now, SEISMO_SPAN);
     ctx.lineWidth = 1.5;
@@ -1062,8 +1286,13 @@ export class Engine {
     fx: { fresh: string; misA: string; misB: string },
     now: number
   ): void {
+    const override = this.captionOverride && now < this.captionOverride.until
+      ? this.captionOverride
+      : null;
+    if (this.captionOverride && !override) this.captionOverride = null;
     const flowOn =
-      this.prefs.caption && this.heat > 0.12 && this.emaWpm > 38 && now - this.lastInput < 900;
+      override !== null ||
+      (this.prefs.caption && this.heat > 0.12 && this.emaWpm > 38 && now - this.lastInput < 900);
     this.captionA += ((flowOn ? 1 : 0) - this.captionA) * 0.12;
     if (this.captionA < 0.02) return;
     const print = sd.id === "print";
@@ -1071,7 +1300,7 @@ export class Engine {
 
     const ctx = this.ctx;
     const fsC = Math.round(this.fs * 0.78);
-    const text = `${Math.round(this.emaWpm)} WPM`;
+    const text = override ? override.text : `${Math.round(this.emaWpm)} WPM`;
     ctx.font = this.font(800, fsC);
     const tw = ctx.measureText(text).width;
     const pad = fsC * 0.7;
@@ -1084,7 +1313,9 @@ export class Engine {
     ctx.globalAlpha = this.captionA;
     ctx.translate(cx, cy);
     ctx.rotate(-0.045);
-    ctx.scale(0.92 + 0.08 * this.captionA, 0.92 + 0.08 * this.captionA);
+    const punch = 1 + clamp(this.captionPunch.x, 0, 1.4) * 0.05;
+    const popScale = (0.92 + 0.08 * this.captionA) * punch;
+    ctx.scale(popScale, popScale);
 
     if (print) {
       ctx.fillStyle = p.ink;
@@ -1265,14 +1496,40 @@ export class Engine {
       ["Ctrl+C", "copy everything you typed"]
     ];
 
-    // Adaptive type size so the whole card always fits the viewport.
-    const lineCount = rows.length + 11;
+    const aboutLines = [
+      "a silent typing playground. the page listens to",
+      "your keyboard and turns rhythm into motion.",
+      "nothing is being tested."
+    ];
+    const inkLines = [
+      "tap a key: light. hold it: heavier. the page remembers.",
+      "hold, then release: the letter stamps. feel the thump.",
+      "streaks build as you type. backspace breaks them.",
+      "the page knows some words. try fire, water, ice, wind.",
+      "palettes answer to their names. zen clears the chrome."
+    ];
+
+    // Adaptive type size: fit by height AND by the widest line, so the
+    // card never overflows its border.
+    const lineCount = rows.length + aboutLines.length + inkLines.length + 7;
+    const pw = Math.min(680, this.w - 64);
     let small = Math.round(this.fs * 0.66);
     small = Math.min(small, Math.floor((this.h * 0.86) / (lineCount * 1.85)));
+    const widest = [...aboutLines, ...inkLines].reduce(
+      (a, b) => (b.length > a.length ? b : a),
+      ""
+    );
+    for (; small > 11; small--) {
+      ctx.font = this.font(460, small);
+      const bodyW = ctx.measureText(widest).width;
+      const rowW =
+        small * 7 +
+        rows.reduce((m, r) => Math.max(m, ctx.measureText(r[1]).width), 0);
+      if (Math.max(bodyW, rowW) <= pw - small * 4.4) break;
+    }
     small = Math.max(small, 11);
     const rowH = Math.round(small * 1.85);
 
-    const pw = Math.min(680, this.w - 64);
     const ph = rowH * lineCount + small * 3;
     const px = (this.w - pw) / 2;
     const py = Math.max(28, (this.h - ph) / 2);
@@ -1309,8 +1566,7 @@ export class Engine {
     y += rowH * 1.4;
 
     section("what this is");
-    body("a silent typing playground. the page listens to your keyboard");
-    body("and turns your rhythm into motion. nothing is being tested.");
+    for (const line of aboutLines) body(line);
     y += rowH * 0.5;
 
     section("controls");
@@ -1326,8 +1582,7 @@ export class Engine {
     y += rowH * 0.5;
 
     section("how the ink works");
-    body("tap a key and it prints light. hold it and it prints heavier.", p.ink);
-    body("type fast and steady, and the ink reacts to your flow.", p.ink);
+    for (const line of inkLines) body(line);
   }
 
   private drawStats(p: Palette): void {
@@ -1345,7 +1600,8 @@ export class Engine {
     const rows: Array<[string, string]> = [
       ["lifetime keystrokes", fmt(this.odo.total)],
       ["this session", fmt(this.sessionKeys)],
-      ["best flow", this.odo.bestWpm ? `${this.odo.bestWpm} WPM` : "not yet"]
+      ["best flow", this.odo.bestWpm ? `${this.odo.bestWpm} WPM` : "not yet"],
+      ["longest streak", this.odo.bestStreak ? fmt(this.odo.bestStreak) : "not yet"]
     ];
     for (const [label, val] of rows) {
       ctx.font = this.font(440, small);
