@@ -23,6 +23,19 @@ the instrument, the page just listens.
   ripple in, rings spread from each landing), Frost (letters crystallize,
   flecks drift down), and Gale (letters blow in with speed lines of wind).
   Nothing is a canned animation; everything scales with your rhythm.
+- The page has mass. Every keystroke imparts a real impulse to the sheet
+  on a spring: ordinary typing barely registers, heavy flow makes the page
+  visibly absorb your rhythm, and Enter lands a thump.
+- The stamp. Hold a key past a beat and release: the letter pulses down,
+  fires a shockwave shaped like its own letterform, and thumps the page in
+  proportion to how long you held. Pressure has a payoff.
+- Streaks. Consecutive keystrokes without backspacing build a streak;
+  milestones (50, 100, 250, 500, 1000...) slam the caption, flash the
+  seismograph, and thump the page. Beating your all-time best flow is
+  celebrated once per session. Longest streak lives in the odometer.
+- Secret words. The page listens to what you write: type fire, water,
+  ice, or wind and the style changes mid-sentence. Palettes answer to
+  their names. Type zen and the chrome disappears.
 - A comic-style caption shows your WPM only during sustained flow, then
   gets out of the way.
 - A seismograph in the bottom margin traces your last 12 seconds of rhythm.
