@@ -13,9 +13,14 @@ export interface FlowInfo {
   active: boolean;
   wpm: number;
   heat: number; // 0..1, drives misregistration and caret glow
+  even: number; // 0..1, cadence consistency (low inter-key variance), drives momentum
 }
 
 const WINDOW_MS = 3000;
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
 
 export class Rhythm {
   private times: number[] = [];
@@ -36,7 +41,7 @@ export class Rhythm {
       i--;
     }
     const wpm = Math.round(((n / (WINDOW_MS / 1000)) * 60) / 5);
-    if (n < 8) return { active: false, wpm, heat: 0 };
+    if (n < 8) return { active: false, wpm, heat: 0, even: 0 };
 
     // Gaps within the window.
     const start = ts.length - n;
@@ -54,7 +59,11 @@ export class Rhythm {
 
     const active = mean < 260 && cv < 0.85 && idle < 700 && first < now;
     const heat = active ? Math.min(1, wpm / 90) : 0;
-    return { active, wpm, heat };
+    // Evenness: the research-backed marker of flow is a consistent
+    // inter-key interval, i.e. a low coefficient of variation. Map cv in
+    // [0, 0.85] to evenness in [1, 0].
+    const even = active ? clamp01(1 - cv / 0.85) : 0;
+    return { active, wpm, heat, even };
   }
 
   /** Timestamps within the trailing span, oldest first. For the seismograph. */
