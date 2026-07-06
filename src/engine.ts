@@ -20,12 +20,24 @@ import { styleOf, STYLES, type StyleDef } from "./styles";
 import { Spring, landCurve, clamp, lerp, easeOut } from "./springs";
 import { Rhythm } from "./rhythm";
 import {
+  EchoRecorder,
+  EchoPlayer,
+  encodeEcho,
+  decodeEcho,
+  type Echo
+} from "./echo";
+import { downloadRhythmPrint } from "./rhythmprint";
+import {
   loadOdometer,
   saveOdometer,
   loadPrefs,
   savePrefs,
   loadSheet,
   saveSheet,
+  loadLatestEcho,
+  saveLatestEcho,
+  loadBestEcho,
+  saveBestEcho,
   type Odometer,
   type Prefs,
   type SavedSheet
@@ -51,7 +63,11 @@ interface Glyph {
   peak: number;
   /** Set when a deliberate hold is released: the letter stamps down. */
   stampAt: number | null;
+  /** Absolute index of this glyph's event in the echo recorder, or -1. */
+  echoIdx: number;
 }
+
+type EchoSource = "off" | "latest" | "best" | "shared";
 
 /** Letterform-shaped shockwave fired by a stamp. */
 interface Stamp {
@@ -168,11 +184,25 @@ export class Engine {
   private rhythm = new Rhythm();
   private emaWpm = 0;
   private heat = 0;
+  /** Slow-building current driven by cadence consistency; 0..1. */
+  private momentum = 0;
+  private lastMomentum = 0;
+  private deepFlowAt = -1e9;
   private lastInput = 0;
   private shiftHeld = false;
   private bsHeld = false;
   private bsSince = 0;
   private bsAcc = 0;
+
+  // Echo: session memory and ghost playback.
+  private recorder = new EchoRecorder();
+  private latestEcho: Echo | null = null;
+  private bestEcho: Echo | null = null;
+  private sharedEcho: Echo | null = null;
+  private echoSource: EchoSource = "off";
+  private echoPlayer: EchoPlayer | null = null;
+  private echoStartedAt = 0;
+  private lastEchoSave = 0;
 
   // Prefs, stats, persistence
   private prefs: Prefs;
@@ -224,17 +254,36 @@ export class Engine {
     window.addEventListener("keydown", (e) => this.onKeyDown(e));
     window.addEventListener("keyup", (e) => this.onKeyUp(e));
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "hidden") this.persist(true);
+      if (document.visibilityState === "hidden") {
+        this.bankLatestEcho();
+        this.persist(true);
+      }
     });
 
     const saved = loadSheet();
     if (saved) this.restore(saved);
     this.caretX.set(this.colX(this.caretIdx));
 
+    this.latestEcho = loadLatestEcho();
+    this.bestEcho = loadBestEcho();
+    this.loadSharedEchoFromUrl();
+
     document.body.style.background = this.palette().paper;
     this.bootAt = performance.now();
     this.prev = this.bootAt;
     requestAnimationFrame((t) => this.frame(t));
+  }
+
+  /** If the page was opened with #e=... in the URL, load it as the ghost. */
+  private loadSharedEchoFromUrl(): void {
+    const hash = window.location.hash;
+    const m = /[#&]e=([A-Za-z0-9\-_]+)/.exec(hash);
+    if (!m) return;
+    const echo = decodeEcho(m[1]!);
+    if (!echo) return;
+    this.sharedEcho = echo;
+    this.setEchoSource("shared");
+    this.toast("Loaded a shared echo. F10 cycles it");
   }
 
   private palette(): Palette {
@@ -333,6 +382,12 @@ export class Engine {
         this.undoClear();
       } else if (k === "c") {
         this.copyAll();
+      } else if (k === "s") {
+        e.preventDefault();
+        this.exportPrint();
+      } else if (k === "e") {
+        e.preventDefault();
+        this.copyEchoLink();
       }
       return;
     }
@@ -413,6 +468,9 @@ export class Engine {
       const g = this.active[i]!;
       if (g.code === e.code && g.upAt === null) {
         g.upAt = now;
+        if (g.echoIdx >= 0) {
+          this.recorder.setWeight(g.echoIdx, Math.round(recordWeight(g.peak)));
+        }
         // The stamp: a deliberate hold released is the payoff of the
         // pressure system. The letter pulses, fires a letterform-shaped
         // shockwave, and thumps the page in proportion to the hold.
@@ -481,6 +539,9 @@ export class Engine {
         this.toast(`Controls strip ${this.prefs.chrome ? "shown" : "hidden"}`);
         savePrefs(this.prefs);
         break;
+      case 10:
+        this.cycleEcho();
+        break;
       default:
         break;
     }
@@ -508,7 +569,8 @@ export class Engine {
       code,
       cap: ch >= "A" && ch <= "Z",
       peak: BASE_W,
-      stampAt: null
+      stampAt: null,
+      echoIdx: this.recorder.note(ch, now)
     };
     this.active.splice(this.caretIdx, 0, g);
     this.caretIdx += 1;
@@ -564,6 +626,7 @@ export class Engine {
 
   private commitLine(now: number): void {
     this.checkSecretWord(now);
+    this.recorder.note("\n", now);
     const line: BakedGlyph[] = this.active.map((g) => ({
       ch: g.ch,
       w: Math.round(recordWeight(g.peak))
@@ -641,6 +704,22 @@ export class Engine {
       this.prefs.caption = !anyOn;
       this.toast(anyOn ? "zen" : "welcome back");
       savePrefs(this.prefs);
+      return;
+    }
+
+    if (word === "echo") {
+      if (this.echoSource !== "off") {
+        this.setEchoSource("off");
+        this.toast("Echo off");
+      } else {
+        const first = this.availableSources().find((s) => s !== "off");
+        if (first) {
+          this.setEchoSource(first);
+          this.toast(`Echo: ${this.echoLabel(first)}`);
+        } else {
+          this.toast("No echoes yet. Type a session, then come back");
+        }
+      }
     }
     void now;
   }
@@ -654,7 +733,8 @@ export class Engine {
       code: "",
       cap: false,
       peak: peakFromRecord(bg.w),
-      stampAt: null
+      stampAt: null,
+      echoIdx: -1
     }));
     this.caretIdx = this.active.length;
     this.caretX.set(this.colX(this.caretIdx));
@@ -724,7 +804,8 @@ export class Engine {
       code: "",
       cap: false,
       peak: peakFromRecord(g.w),
-      stampAt: null
+      stampAt: null,
+      echoIdx: -1
     }));
     this.caretIdx = this.active.length;
   }
@@ -748,6 +829,100 @@ export class Engine {
     this.toastAt = performance.now();
   }
 
+  // ------------------------------------------------------------- echo
+
+  private echoFor(src: EchoSource): Echo | null {
+    if (src === "latest") return this.latestEcho;
+    if (src === "best") return this.bestEcho;
+    if (src === "shared") return this.sharedEcho;
+    return null;
+  }
+
+  private echoLabel(src: EchoSource): string {
+    if (src === "latest") return "your last session";
+    if (src === "best") return "your best flow";
+    if (src === "shared") return "a shared rhythm";
+    return "off";
+  }
+
+  private availableSources(): EchoSource[] {
+    const out: EchoSource[] = ["off"];
+    if (this.latestEcho) out.push("latest");
+    if (this.bestEcho) out.push("best");
+    if (this.sharedEcho) out.push("shared");
+    return out;
+  }
+
+  private setEchoSource(src: EchoSource): void {
+    this.echoSource = src;
+    const echo = this.echoFor(src);
+    if (src === "off" || !echo) {
+      this.echoSource = "off";
+      this.echoPlayer = null;
+      return;
+    }
+    this.echoPlayer = new EchoPlayer(echo);
+    this.echoStartedAt = performance.now();
+  }
+
+  private cycleEcho(): void {
+    const avail = this.availableSources();
+    if (avail.length === 1) {
+      this.toast("No echoes yet. Type a session, then come back");
+      return;
+    }
+    const i = avail.indexOf(this.echoSource);
+    const next = avail[(i + 1) % avail.length]!;
+    this.setEchoSource(next);
+    this.toast(next === "off" ? "Echo off" : `Echo: ${this.echoLabel(next)}`);
+  }
+
+  /** Persist the current session for next time as the "latest" echo. */
+  private bankLatestEcho(): void {
+    if (this.recorder.length < 16) return;
+    saveLatestEcho(this.recorder.toEcho());
+  }
+
+  private exportPrint(): void {
+    const echo =
+      this.recorder.length >= 8
+        ? this.recorder.toEcho()
+        : this.bestEcho ?? this.latestEcho;
+    if (!echo || echo.events.length < 8) {
+      this.toast("Type a little first, then Ctrl+S");
+      return;
+    }
+    const p = this.palette();
+    const ok = downloadRhythmPrint(
+      echo,
+      { paper: p.paper, ink: p.ink, fresh: p.fresh, sub: p.sub, misA: p.misA, misB: p.misB },
+      {
+        total: this.odo.total,
+        bestWpm: this.odo.bestWpm,
+        styleLabel: this.style().label,
+        paletteLabel: p.label
+      }
+    );
+    this.toast(ok ? "Rhythm print saved" : "Nothing to print yet");
+  }
+
+  private copyEchoLink(): void {
+    const echo =
+      this.recorder.length >= 16
+        ? this.recorder.toEcho()
+        : this.bestEcho ?? this.latestEcho;
+    if (!echo || echo.events.length < 16) {
+      this.toast("Type a session first, then Ctrl+E");
+      return;
+    }
+    const code = encodeEcho(echo);
+    const url = `${window.location.origin}${window.location.pathname}#e=${code}`;
+    navigator.clipboard
+      .writeText(url)
+      .then(() => this.toast("Echo link copied. It carries what you typed"))
+      .catch(() => this.toast("Copy failed"));
+  }
+
   // ------------------------------------------------------------ frame
 
   private frame(t: number): void {
@@ -758,13 +933,36 @@ export class Engine {
     const flow = this.rhythm.flow(t);
     this.emaWpm += (flow.wpm - this.emaWpm) * Math.min(1, dt * 3);
     this.heat += (flow.heat - this.heat) * Math.min(1, dt * 4);
+
+    // Momentum: builds slowly while cadence stays even, recedes faster when
+    // it breaks. Rising tau ~7.5s, falling tau ~3.5s.
+    const target = flow.even;
+    const tau = target > this.momentum ? 7.5 : 3.5;
+    this.momentum += (target - this.momentum) * (1 - Math.exp(-dt / tau));
+    if (this.momentum > 0.66 && this.lastMomentum <= 0.66 && t - this.deepFlowAt > 9000) {
+      this.deepFlowAt = t;
+      this.toast("deep flow");
+    }
+    this.lastMomentum = this.momentum;
+
     if (flow.active && Math.round(this.emaWpm) > this.odo.bestWpm) {
       this.odo.bestWpm = Math.round(this.emaWpm);
       this.dirtyOdo = true;
+      // Snapshot the run that set the record as the "best" echo.
+      if (this.recorder.length >= 16) {
+        this.bestEcho = this.recorder.toEcho(400, "best flow");
+        saveBestEcho(this.bestEcho);
+      }
       if (!this.celebratedBest && this.bestAtBoot >= 40) {
         this.celebratedBest = true;
         this.celebrate(`NEW BEST ${this.odo.bestWpm} WPM`, t);
       }
+    }
+
+    // Bank the live session as next boot's "latest" echo, throttled.
+    if (t - this.lastEchoSave > 5000 && this.recorder.length >= 16) {
+      this.lastEchoSave = t;
+      this.bankLatestEcho();
     }
 
     // Our own accelerating backspace repeat.
@@ -821,6 +1019,10 @@ export class Engine {
     ctx.fillStyle = p.paper;
     ctx.fillRect(0, 0, this.w, this.h);
 
+    // Deep-flow environment: an ambient backdrop earned by sustained even
+    // typing. Drawn in screen space so it does not bob with keystrokes.
+    this.drawEnvironment(p, fx, now, mm);
+
     // The page has mass: the whole world rides the impact spring.
     // 0.42 maps spring units to px: a character lands ~0.25 px, Enter
     // ~1.8 px, a full-power stamp ~3.5 px, clamped at 4.
@@ -838,6 +1040,7 @@ export class Engine {
     ctx.drawImage(this.staticCanvas, 0, (slide + pageY) * this.dpr);
     ctx.restore();
 
+    this.drawEcho(p, fx, now);
     this.drawParticles(fx, now);
     this.drawActiveLine(p, sd, fx, now, mm);
     this.drawStamps(fx, now, mm);
@@ -1188,6 +1391,107 @@ export class Engine {
     ctx.globalAlpha = 1;
   }
 
+  private withAlpha(color: string, a: number): string {
+    if (color[0] === "#") {
+      const v = parseInt(color.slice(1), 16);
+      return `rgba(${(v >> 16) & 255},${(v >> 8) & 255},${v & 255},${a})`;
+    }
+    const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(color);
+    if (m) return `rgba(${m[1]},${m[2]},${m[3]},${a})`;
+    return color;
+  }
+
+  /**
+   * The deep-flow environment. Side blooms creep in from the vertical edges
+   * as momentum climbs; once deep in flow, slow aurora bands drift near the
+   * top and bottom margins. Everything is low-contrast and peripheral, so
+   * the text stays the hero; it is purely a reward for sustained cadence.
+   */
+  private drawEnvironment(
+    p: Palette,
+    fx: { fresh: string; misA: string; misB: string },
+    now: number,
+    mm: number
+  ): void {
+    const m = this.momentum * mm;
+    if (m < 0.04) return;
+    const ctx = this.ctx;
+    void p;
+
+    const reach = this.w * (0.1 + m * 0.16);
+    const intensity = m * 0.16;
+    const left = ctx.createLinearGradient(0, 0, reach, 0);
+    left.addColorStop(0, this.withAlpha(fx.fresh, intensity));
+    left.addColorStop(1, this.withAlpha(fx.fresh, 0));
+    ctx.fillStyle = left;
+    ctx.fillRect(0, 0, reach, this.h);
+    const right = ctx.createLinearGradient(this.w, 0, this.w - reach, 0);
+    right.addColorStop(0, this.withAlpha(fx.fresh, intensity));
+    right.addColorStop(1, this.withAlpha(fx.fresh, 0));
+    ctx.fillStyle = right;
+    ctx.fillRect(this.w - reach, 0, reach, this.h);
+
+    if (m > 0.5) {
+      const bandA = (m - 0.5) * 0.22;
+      for (let b = 0; b < 3; b++) {
+        const phase = now / 2600 + b * 1.7;
+        const col = b % 2 ? fx.misA : fx.misB;
+        const yTop = this.h * (0.16 + b * 0.03) + Math.sin(phase) * 18;
+        const gTop = ctx.createLinearGradient(0, yTop - 60, 0, yTop + 60);
+        gTop.addColorStop(0, this.withAlpha(col, 0));
+        gTop.addColorStop(0.5, this.withAlpha(col, bandA));
+        gTop.addColorStop(1, this.withAlpha(col, 0));
+        ctx.fillStyle = gTop;
+        ctx.fillRect(0, yTop - 60, this.w, 120);
+
+        const yBot = this.h * (0.84 - b * 0.03) + Math.cos(phase) * 18;
+        const colB = b % 2 ? fx.misB : fx.misA;
+        const gBot = ctx.createLinearGradient(0, yBot - 60, 0, yBot + 60);
+        gBot.addColorStop(0, this.withAlpha(colB, 0));
+        gBot.addColorStop(0.5, this.withAlpha(colB, bandA));
+        gBot.addColorStop(1, this.withAlpha(colB, 0));
+        ctx.fillStyle = gBot;
+        ctx.fillRect(0, yBot - 60, this.w, 120);
+      }
+    }
+  }
+
+  /**
+   * The echo ghost: a past (or shared) session replayed one line above the
+   * typing line, faint and slightly smaller, typing in its original cadence.
+   * A duet with a recorded rhythm, not a race.
+   */
+  private drawEcho(
+    p: Palette,
+    fx: { fresh: string; misA: string; misB: string },
+    now: number
+  ): void {
+    if (this.echoSource === "off" || !this.echoPlayer) return;
+    void fx;
+    const st = this.echoPlayer.state(now, this.echoStartedAt, this.maxCols);
+    const y = this.typingY - this.lineHeight * 1.5;
+    const ctx = this.ctx;
+    ctx.textBaseline = "alphabetic";
+    const base = 0.3 * st.fade;
+    const color = mixHex(p.sub, p.fresh, 0.3);
+    const px = Math.round(this.fs * 0.9);
+
+    for (const g of st.line) {
+      const fadeIn = clamp((st.elapsed - g.fireT) / 70, 0, 1);
+      ctx.globalAlpha = base * fadeIn;
+      ctx.font = this.font(g.w, px);
+      ctx.fillStyle = color;
+      ctx.fillText(g.ch, this.colX(g.col), y);
+    }
+
+    const blink = 0.5 + 0.5 * Math.abs(Math.sin(now / 420));
+    ctx.globalAlpha = base * blink;
+    ctx.fillStyle = color;
+    const cw = Math.max(2, this.advance * 0.12);
+    ctx.fillRect(this.colX(st.caretCol) + 0.5, y - this.fs * 0.92, cw, this.fs * 1.05);
+    ctx.globalAlpha = 1;
+  }
+
   private drawCaret(
     p: Palette,
     sd: StyleDef,
@@ -1379,7 +1683,9 @@ export class Engine {
     ctx.font = this.font(440, Math.round(small * 0.92));
     ctx.fillText("start typing, anywhere on this page", x, y);
     y += small * 1.55;
-    ctx.fillText("hold a key down and it prints heavier. the page remembers.", x, y);
+    ctx.fillText("hold a key and it prints heavier. find a rhythm and the page wakes up.", x, y);
+    y += small * 1.55;
+    ctx.fillText("it remembers your sessions. F10 types one back beside you.", x, y);
     y += small * 1.55;
     ctx.fillStyle = p.fresh;
     ctx.fillText("press F1 for everything else", x, y);
@@ -1399,8 +1705,9 @@ export class Engine {
     const a = this.heat > 0.25 ? 0.14 : idleFor > 4000 ? 0.62 : 0.4;
 
     ctx.font = this.font(460, small);
-    const status = `${this.palette().label} · ${sd.label}`;
-    const controls = "F1 help   F2/F3 palette   F4 style   Esc clear";
+    const echoNote = this.echoSource !== "off" ? `  ·  echo: ${this.echoLabel(this.echoSource)}` : "";
+    const status = `${this.palette().label} · ${sd.label}${echoNote}`;
+    const controls = "F1 help   F4 style   F10 echo   Esc clear";
 
     ctx.globalAlpha = a;
     ctx.fillStyle = p.sub;
@@ -1491,22 +1798,26 @@ export class Engine {
       ["F7", `motion: ${["off", "subtle", "full"][this.prefs.motion]}`],
       ["F8", "keystroke odometer"],
       ["F9", `controls strip ${this.prefs.chrome ? "(shown)" : "(hidden)"}`],
+      ["F10", `echo: ${this.echoSource === "off" ? "off" : this.echoLabel(this.echoSource)}`],
       ["Esc", "clear the page"],
       ["Ctrl+Z", "bring back what you cleared"],
-      ["Ctrl+C", "copy everything you typed"]
+      ["Ctrl+C", "copy everything you typed"],
+      ["Ctrl+S", "save a rhythm print of this session"],
+      ["Ctrl+E", "copy a link that carries your rhythm"]
     ];
 
     const aboutLines = [
       "a silent typing playground. the page listens to",
       "your keyboard and turns rhythm into motion.",
-      "nothing is being tested."
+      "nothing is tested. it remembers how you type."
     ];
     const inkLines = [
       "tap a key: light. hold it: heavier. the page remembers.",
       "hold, then release: the letter stamps. feel the thump.",
-      "streaks build as you type. backspace breaks them.",
-      "the page knows some words. try fire, water, ice, wind.",
-      "palettes answer to their names. zen clears the chrome."
+      "type with an even rhythm to build flow. the edges wake up.",
+      "echo (F10) replays a past session beside you. type along.",
+      "the page knows words: fire, water, ice, wind, zen, echo.",
+      "Ctrl+S keeps a print of your rhythm. Ctrl+E shares it."
     ];
 
     // Adaptive type size: fit by height AND by the widest line, so the
@@ -1597,11 +1908,22 @@ export class Engine {
     cy += small * 3.4;
 
     const fmt = (n: number) => n.toLocaleString("en-US");
+    const tier =
+      this.momentum > 0.66 ? "deep flow" : this.momentum > 0.33 ? "warming" : "calm";
+    const echoes = this.availableSources().filter((s) => s !== "off");
+    const echoNote =
+      echoes.length === 0
+        ? "none saved yet"
+        : echoes
+            .map((s) => (s === "latest" ? "last" : s === "best" ? "best" : "shared"))
+            .join(" · ");
     const rows: Array<[string, string]> = [
       ["lifetime keystrokes", fmt(this.odo.total)],
       ["this session", fmt(this.sessionKeys)],
       ["best flow", this.odo.bestWpm ? `${this.odo.bestWpm} WPM` : "not yet"],
-      ["longest streak", this.odo.bestStreak ? fmt(this.odo.bestStreak) : "not yet"]
+      ["longest streak", this.odo.bestStreak ? fmt(this.odo.bestStreak) : "not yet"],
+      ["flow right now", tier],
+      ["echoes", echoNote]
     ];
     for (const [label, val] of rows) {
       ctx.font = this.font(440, small);
