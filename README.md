@@ -35,7 +35,23 @@ the instrument, the page just listens.
   celebrated once per session. Longest streak lives in the odometer.
 - Secret words. The page listens to what you write: type fire, water,
   ice, or wind and the style changes mid-sentence. Palettes answer to
-  their names. Type zen and the chrome disappears.
+  their names. Type zen and the chrome disappears; type echo to summon a
+  ghost (see below).
+- Flow momentum. Type with an even, consistent cadence and a slow current
+  builds. As it climbs, the screen edges wake up and, deep in flow, soft
+  aurora bands drift through the margins. Stutter or pause and it recedes.
+  This rewards a steady rhythm, never raw speed; consistency of inter-key
+  timing is the actual marker of typing flow.
+- Echo. The page records your sessions and can replay one as a faint ghost
+  typing alongside you in its original cadence: a duet with your past self,
+  not a race against a fixed text. F10 cycles off / your last session /
+  your best flow / a shared echo. Because a rhythm is just data, Ctrl+E
+  copies a link that carries it, so someone else can type alongside your
+  ghost. (That link contains the text you typed.)
+- Rhythm Print. Ctrl+S exports the session as a generative poster: every
+  keystroke becomes a tick on a sunflower spiral, with length encoding your
+  cadence and thickness your pressure. The same session always yields the
+  same print: a fingerprint of how you typed, saved as a PNG.
 - A comic-style caption shows your WPM only during sustained flow, then
   gets out of the way.
 - A seismograph in the bottom margin traces your last 12 seconds of rhythm.
@@ -62,9 +78,12 @@ needed.
 | F7       | Motion: full / subtle / off                          |
 | F8       | Odometer and stats                                   |
 | F9       | Controls strip show/hide                             |
+| F10      | Echo: off / last session / best flow / shared        |
 | Esc      | Clear the sheet                                      |
 | Ctrl+Z   | Restore the cleared sheet                            |
 | Ctrl+C   | Copy everything you typed                            |
+| Ctrl+S   | Save a rhythm print (PNG) of this session            |
+| Ctrl+E   | Copy a shareable link carrying your rhythm           |
 
 F11 (browser fullscreen) is left to the browser on purpose; it makes the
 page better. Motion defaults to "subtle" if your OS asks for reduced motion.
@@ -136,6 +155,15 @@ DNS record automatically.
   (position, squash).
 - Flow detection uses a rolling 3-second window: mean inter-key gap and
   coefficient of variation, tuned for the 70 to 90 WPM range where real
-  typing mixes 60 to 90 ms rolls with 250 ms+ word boundaries.
+  typing mixes 60 to 90 ms rolls with 250 ms+ word boundaries. The same
+  coefficient of variation drives a slower momentum scalar (asymmetric
+  rise and decay) behind the deep-flow environment.
+- Echo records sessions as a forward-only event stream (character, gap,
+  settled weight) in a bounded ring buffer, replays them by walking the
+  list each frame against a looping clock, and serializes to a URL-safe
+  base64 code for sharing. Backspaces are intentionally not recorded.
+- The rhythm print is a one-shot off-screen render: a phyllotaxis spiral
+  of ticks derived deterministically from the session, exported via
+  toDataURL. It never runs on the hot path.
 - All persistence is localStorage with try/catch guards; the site works
   fully without it.
