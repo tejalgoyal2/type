@@ -12,7 +12,6 @@ export interface Odometer {
 }
 
 import type { StyleId } from "./styles";
-import type { Echo } from "./echo";
 
 export interface Prefs {
   palette: number;
@@ -36,8 +35,6 @@ export interface SavedSheet {
 const ODO_KEY = "typef.odometer.v1";
 const PREFS_KEY = "typef.prefs.v1";
 const SHEET_KEY = "typef.sheet.v1";
-const ECHO_LATEST_KEY = "typef.echo.latest.v1";
-const ECHO_BEST_KEY = "typef.echo.best.v1";
 
 function read<T>(key: string): T | null {
   try {
@@ -99,28 +96,4 @@ export function loadSheet(): SavedSheet | null {
 
 export function saveSheet(sheet: SavedSheet): void {
   write(SHEET_KEY, sheet);
-}
-
-function validEcho(e: unknown): Echo | null {
-  const echo = e as Echo | null;
-  if (!echo || echo.v !== 1 || !Array.isArray(echo.events) || echo.events.length === 0) {
-    return null;
-  }
-  return echo;
-}
-
-export function loadLatestEcho(): Echo | null {
-  return validEcho(read<Echo>(ECHO_LATEST_KEY));
-}
-
-export function saveLatestEcho(echo: Echo): void {
-  write(ECHO_LATEST_KEY, echo);
-}
-
-export function loadBestEcho(): Echo | null {
-  return validEcho(read<Echo>(ECHO_BEST_KEY));
-}
-
-export function saveBestEcho(echo: Echo): void {
-  write(ECHO_BEST_KEY, echo);
 }
