@@ -52,6 +52,11 @@ the instrument, the page just listens.
   keystroke becomes a tick on a sunflower spiral, with length encoding your
   cadence and thickness your pressure. The same session always yields the
   same print: a fingerprint of how you typed, saved as a PNG.
+- The writing surface. The page is a faint ruled sheet: a line under every
+  row, fading with distance, so the space reads as paper rather than a void.
+  The active line is a living horizon, tinted toward the accent and lighting
+  up under the caret with every keystroke. Quiet line numbers run down the
+  left margin for the rows you have written.
 - A comic-style caption shows your WPM only during sustained flow, then
   gets out of the way.
 - A seismograph in the bottom margin traces your last 12 seconds of rhythm.
