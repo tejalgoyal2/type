@@ -174,6 +174,19 @@ export const PALETTES: Palette[] = [
     misB: "#B3563A",
     captionBg: "#C8C7AE",
     captionInk: "#2E2F25"
+  },
+  {
+    id: "dusk",
+    label: "Dusk",
+    dark: true,
+    paper: "#1A1520",
+    ink: "#D4C8E8",
+    fresh: "#B07FE8",
+    sub: "#3D3450",
+    misA: "#7B9EDF",
+    misB: "#E88CB0",
+    captionBg: "#251F30",
+    captionInk: "#D4C8E8"
   }
 ];
 
