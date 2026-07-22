@@ -164,9 +164,13 @@ DNS record automatically.
   coefficient of variation drives a slower momentum scalar (asymmetric
   rise and decay) behind the deep-flow environment.
 - Echo records sessions as a forward-only event stream (character, gap,
-  settled weight) in a bounded ring buffer, replays them by walking the
-  list each frame against a looping clock, and serializes to a URL-safe
-  base64 code for sharing. Backspaces are intentionally not recorded.
+  settled weight) in a bounded ring buffer. Backspaces are intentionally
+  not recorded.
+- The writing surface is a full-height ruled grid: rule opacity falls off
+  with distance from the active line, the active rule brightens under the
+  caret on each keystroke, and line numbers appear in the left margin for
+  committed rows. All of it is drawn on the composited canvas frame, not
+  DOM nodes.
 - The rhythm print is a one-shot off-screen render: a phyllotaxis spiral
   of ticks derived deterministically from the session, exported via
   toDataURL. It never runs on the hot path.
