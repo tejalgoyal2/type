@@ -5,6 +5,8 @@ body {
   height: 100%;
   overflow: hidden;
   background: #f4efe6;
+  -webkit-font-smoothing: antialiased;
+  touch-action: none;
 }
 
 #stage {
