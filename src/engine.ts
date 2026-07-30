@@ -108,7 +108,7 @@ interface Ripple {
   power: number;
 }
 
-const RIPPLE_CAP = 48;
+const RIPPLE_CAP = 60;
 
 /** Weight a glyph keeps forever, derived from the peak it reached while held. */
 function recordWeight(peak: number): number {
