@@ -29,6 +29,7 @@ export interface Probe {
   canUndo: boolean;
   rafSkew: number;
   blooms: number;
+  race: { gear: number; bursts: number; laps: number; zone: number };
   world: string | null;
 }
 

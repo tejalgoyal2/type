@@ -22,6 +22,7 @@ import { Rhythm } from "./rhythm";
 import { EchoRecorder } from "./echo";
 import { renderProof, showProof } from "./proof";
 import { Worlds, WORLD_IDS, type WorldId, type Row } from "./worlds";
+import { Race } from "./race";
 import {
   DOODLES,
   DOODLE_DRAW,
@@ -208,8 +209,15 @@ function keyLabel(code: string): string {
   return code;
 }
 
+const STREAK_WORDS = ["NICE!", "ZOOM!", "KAPOW!", "UNSTOPPABLE!", "LEGENDARY!", "GODLIKE!", "IMMORTAL!"];
+
 export class Engine {
+  /** The page is drawn here, then put on screen through the race camera. */
+  private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private vctx: CanvasRenderingContext2D;
+  private race = new Race();
+  private lastSlide = 0;
   private staticCanvas: HTMLCanvasElement;
   private staticCtx: CanvasRenderingContext2D;
 
@@ -321,10 +329,13 @@ export class Engine {
   private bootAt: number;
   private prev: number;
 
-  constructor(private canvas: HTMLCanvasElement) {
-    const ctx = canvas.getContext("2d", { desynchronized: true, alpha: false });
-    if (!ctx) throw new Error("2D canvas is not available");
+  constructor(private view: HTMLCanvasElement) {
+    const vctx = view.getContext("2d", { desynchronized: true, alpha: false });
+    this.canvas = document.createElement("canvas");
+    const ctx = this.canvas.getContext("2d", { alpha: false });
+    if (!ctx || !vctx) throw new Error("2D canvas is not available");
     this.ctx = ctx;
+    this.vctx = vctx;
 
     this.staticCanvas = document.createElement("canvas");
     const sctx = this.staticCanvas.getContext("2d");
@@ -361,7 +372,7 @@ export class Engine {
       }
     });
     window.addEventListener("pagehide", () => this.persist(true));
-    canvas.addEventListener("pointerdown", (e) => this.onPointer(e));
+    view.addEventListener("pointerdown", (e) => this.onPointer(e));
 
     const saved = loadSheet();
     if (saved) {
@@ -426,12 +437,12 @@ export class Engine {
     this.dpr = Math.min(window.devicePixelRatio || 1, 2.5);
     this.w = window.innerWidth;
     this.h = window.innerHeight;
-    for (const c of [this.canvas, this.staticCanvas]) {
+    for (const c of [this.view, this.canvas, this.staticCanvas]) {
       c.width = Math.round(this.w * this.dpr);
       c.height = Math.round(this.h * this.dpr);
     }
-    this.canvas.style.width = `${this.w}px`;
-    this.canvas.style.height = `${this.h}px`;
+    this.view.style.width = `${this.w}px`;
+    this.view.style.height = `${this.h}px`;
 
     this.fs = clamp(Math.round(this.w / 42), 18, 34);
     this.lineHeight = Math.round(this.fs * 1.62);
@@ -914,6 +925,7 @@ export class Engine {
     this.lastInput = now;
     this.squash.kick(3.9 * this.motionMul());
     this.impact.kick(12 * this.motionMul());
+    this.race.key(this.motionMul());
     this.bumpStreak(now);
     if (ch !== " " && this.motionMul() > 0) {
       this.ripples.push({
@@ -989,6 +1001,9 @@ export class Engine {
   private celebrate(text: string, now: number): void {
     this.captionOverride = { text, until: now + 2300 };
     this.captionPunch.kick(6);
+    const m = STREAK_MILESTONES.indexOf(this.streak);
+    const word = text.startsWith("STREAK") && m >= 0 ? STREAK_WORDS[Math.min(m, STREAK_WORDS.length - 1)]! : `${text}!`;
+    this.race.burst(word, this.caretX.x, this.typingY - this.lineHeight * 1.9, now, this.motionMul(), this.w);
     this.impact.kick(80 * this.motionMul());
     this.seismoFlashAt = now;
   }
@@ -1014,6 +1029,10 @@ export class Engine {
 
   /** Move the active row into the document and start a fresh one. */
   private bakeActive(soft: boolean, now: number): void {
+    // Every row is a lap, timed from its first key to the moment it is set.
+    const chars = this.active.filter((g) => g.ch !== " ").length;
+    const lapMs = this.active.length ? now - Math.min(...this.active.map((g) => g.born)) : 0;
+    this.race.lap(this.lines.length, this.colX(this.active.length), chars, lapMs, now);
     this.lines.push({
       glyphs: this.active.map((g) => ({ ch: g.ch, w: Math.round(recordWeight(g.peak)) })),
       soft,
@@ -1341,6 +1360,7 @@ export class Engine {
     canUndo: boolean;
     rafSkew: number;
     blooms: number;
+    race: { gear: number; bursts: number; laps: number; zone: number };
     world: string | null;
   } {
     if (this.staticDirty) this.renumber();
@@ -1366,6 +1386,7 @@ export class Engine {
       canUndo: this.undoSlot !== null,
       rafSkew: this.rafSkew,
       blooms: this.blooms.length,
+      race: this.race.probe(),
       world: this.worlds.id
     };
   }
@@ -1518,8 +1539,53 @@ export class Engine {
     this.captionPunch.target = 0;
     this.captionPunch.update(dt);
 
+    this.race.update(dt, t, this.emaWpm, t - this.lastInput < 1500, this.caretX.x, this.typingY, this.motionMul(), this.w, this.h);
+    if (this.race.pendingBurst) {
+      this.race.burst(this.race.pendingBurst, this.caretX.x, this.typingY - this.lineHeight * 1.9, t, this.motionMul(), this.w);
+      this.race.pendingBurst = null;
+    }
+
     this.persist(false);
     this.draw(t);
+    this.present(t);
+  }
+
+  /** Put the page on screen through the camera, then the race HUD over it. */
+  private present(now: number): void {
+    const v = this.vctx;
+    const p = this.palette();
+    const cam = this.race.camera(now);
+    v.setTransform(1, 0, 0, 1, 0, 0);
+    v.globalAlpha = 1;
+    v.globalCompositeOperation = "source-over";
+    if (!cam) {
+      v.drawImage(this.canvas, 0, 0);
+    } else {
+      const d = this.dpr;
+      v.fillStyle = p.paper;
+      v.fillRect(0, 0, this.view.width, this.view.height);
+      v.translate((cam.fx + cam.x) * d, (cam.fy + cam.y) * d);
+      v.rotate(cam.rot);
+      v.scale(cam.s, cam.s);
+      v.translate(-cam.fx * d, -cam.fy * d);
+      v.drawImage(this.canvas, 0, 0);
+    }
+    v.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    const calm = this.helpOpen || this.statsOpen;
+    const rowY = (row: number) => this.typingY - (this.lines.length - row) * this.lineHeight + this.lastSlide;
+    this.race.hud(
+      v,
+      { ink: p.ink, paper: p.paper, sub: p.sub, dark: p.dark },
+      this.w,
+      this.h,
+      now,
+      this.motionMul(),
+      (w, px) => this.font(w, px),
+      rowY,
+      this.fs,
+      calm
+    );
+    v.globalAlpha = 1;
   }
 
   // ------------------------------------------------------------- draw
@@ -1577,6 +1643,7 @@ export class Engine {
     if (this.staticDirty) this.rebuildStatic(p, fx);
     const slideT = clamp((now - this.slideFrom) / 170, 0, 1);
     const slide = (1 - easeOut(slideT)) * this.lineHeight * mm;
+    this.lastSlide = slide;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = this.inkAlpha;
