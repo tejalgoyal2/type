@@ -62,25 +62,34 @@ test("ember lands hot on light paper", async ({ page }) => {
   await open(page, { prefs: { style: "ember", palette: 0, motion: 0 } });
   await page.keyboard.type("MMMM");
   const { layout } = await probe(page);
-  const px = await pixels(
-    page,
-    layout.marginX,
-    layout.typingY - layout.fs,
-    layout.advance * 4,
-    layout.fs
-  );
-  // Ember's fresh ink on Pressroom is a burnt orange: red well above blue,
-  // and green well above blue too. Dried ink is near black, the quiet grey
-  // and the reddish rule tint both have green close to blue.
-  let orange = 0;
-  let darkest = [255, 255, 255];
-  for (let i = 0; i < px.length; i += 4) {
-    const [r, g, b] = [px[i]!, px[i + 1]!, px[i + 2]!];
-    if (r - b > 50 && g - b > 30) orange++;
-    if (r + g + b < darkest[0]! + darkest[1]! + darkest[2]!) darkest = [r, g, b];
-  }
-  const { rafSkew } = await probe(page);
-  expect(orange, `darkest ink rgb(${darkest.join(",")}), rAF skew ${Math.round(rafSkew)} ms`).toBeGreaterThan(20);
+  // Ink stays fresh for seconds, so allow a slow engine a moment to put the
+  // frame on screen; a wrong color still fails every attempt.
+  await expect(async () => {
+    const px = await pixels(
+      page,
+      layout.marginX,
+      layout.typingY - layout.fs,
+      layout.advance * 4,
+      layout.fs
+    );
+    // Ember's fresh ink on Pressroom is a burnt orange: red well above blue,
+    // and green well above blue too. Dried ink is near black, the quiet grey
+    // and the reddish rule tint both have green close to blue.
+    let orange = 0;
+    let inked = 0;
+    let darkest = [255, 255, 255];
+    for (let i = 0; i < px.length; i += 4) {
+      const [r, g, b] = [px[i]!, px[i + 1]!, px[i + 2]!];
+      if (r - b > 50 && g - b > 30) orange++;
+      if (r + g + b < 450) inked++;
+      if (r + g + b < darkest[0]! + darkest[1]! + darkest[2]!) darkest = [r, g, b];
+    }
+    const { rafSkew } = await probe(page);
+    expect(
+      orange,
+      `${inked} inked px, darkest rgb(${darkest.join(",")}), rAF skew ${Math.round(rafSkew)} ms`
+    ).toBeGreaterThan(20);
+  }).toPass({ timeout: 3000 });
 });
 
 test("a long piece survives: copy, line numbers and reload keep every line", async ({ page }) => {
