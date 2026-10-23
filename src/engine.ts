@@ -659,8 +659,13 @@ export class Engine {
     if (e.key === "Shift") this.shiftHeld = false;
     if (e.key === "Backspace") this.bsHeld = false;
     if (e.key === "Escape" && this.escDownAt !== null) {
-      if (now - this.escDownAt < 220) this.toast("hold Esc to clear the sheet");
+      const held = now - this.escDownAt;
       this.escDownAt = null;
+      // A long enough hold counts even if no frame landed to see it through.
+      if (held >= ESC_HOLD_MS) {
+        this.clearSheet();
+        this.escLift.set(0);
+      } else if (held < 220) this.toast("hold Esc to clear the sheet");
     }
     for (let i = 0; i < this.active.length; i++) {
       const g = this.active[i]!;

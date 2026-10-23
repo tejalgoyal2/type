@@ -171,6 +171,31 @@ test("Esc must be held to clear, and the undo survives a reload", async ({ page 
   await expectText(page, text);
 });
 
+test("a full Esc hold clears even if no frame lands during it", async ({ page }) => {
+  await open(page, { prefs: { motion: 0 } });
+  await page.keyboard.type("stalled frames");
+  await expectText(page, "stalled frames");
+  // Hold every animation frame back, as a busy machine would.
+  await page.evaluate(() => {
+    const w = window as unknown as { __held: FrameRequestCallback[]; __raf: typeof requestAnimationFrame };
+    w.__held = [];
+    w.__raf = window.requestAnimationFrame;
+    window.requestAnimationFrame = (cb) => (w.__held.push(cb), 0);
+  });
+  await page.waitForTimeout(100);
+  await page.keyboard.down("Escape");
+  await page.waitForTimeout(900);
+  await page.keyboard.up("Escape");
+  expect((await probe(page)).text).toBe("");
+  await page.evaluate(() => {
+    const w = window as unknown as { __held: FrameRequestCallback[]; __raf: typeof requestAnimationFrame };
+    window.requestAnimationFrame = w.__raf;
+    for (const cb of w.__held) w.__raf(cb);
+  });
+  await page.keyboard.press(`${MOD}+z`);
+  await expectText(page, "stalled frames");
+});
+
 test("held keys let go when the window loses focus", async ({ page }) => {
   await open(page, { prefs: { motion: 0 } });
   await page.keyboard.type("a".repeat(40));
