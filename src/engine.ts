@@ -22,7 +22,7 @@ import { Rhythm } from "./rhythm";
 import { EchoRecorder } from "./echo";
 import { renderProof, showProof } from "./proof";
 import { Worlds, WORLD_IDS, type WorldId, type Row } from "./worlds";
-import { Race } from "./race";
+import { Cine } from "./cine";
 import {
   DOODLES,
   DOODLE_DRAW,
@@ -209,14 +209,16 @@ function keyLabel(code: string): string {
   return code;
 }
 
-const STREAK_WORDS = ["NICE!", "ZOOM!", "KAPOW!", "UNSTOPPABLE!", "LEGENDARY!", "GODLIKE!", "IMMORTAL!"];
-
 export class Engine {
-  /** The page is drawn here, then put on screen through the race camera. */
+  /** The page is drawn here, then put on screen through the camera. */
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private vctx: CanvasRenderingContext2D;
-  private race = new Race();
+  private cine = new Cine();
+  /** Depth of field: a small blurred copy of the history, soft only far from the pen. */
+  private dofSoft: HTMLCanvasElement | null = null;
+  /** Where the caret has just been, for its trail. */
+  private trail: { x: number; t: number }[] = [];
   private lastSlide = 0;
   private staticCanvas: HTMLCanvasElement;
   private staticCtx: CanvasRenderingContext2D;
@@ -925,7 +927,7 @@ export class Engine {
     this.lastInput = now;
     this.squash.kick(3.9 * this.motionMul());
     this.impact.kick(12 * this.motionMul());
-    this.race.key(this.motionMul());
+    this.cine.key(this.motionMul());
     this.bumpStreak(now);
     if (ch !== " " && this.motionMul() > 0) {
       this.ripples.push({
@@ -1001,9 +1003,6 @@ export class Engine {
   private celebrate(text: string, now: number): void {
     this.captionOverride = { text, until: now + 2300 };
     this.captionPunch.kick(6);
-    const m = STREAK_MILESTONES.indexOf(this.streak);
-    const word = text.startsWith("STREAK") && m >= 0 ? STREAK_WORDS[Math.min(m, STREAK_WORDS.length - 1)]! : `${text}!`;
-    this.race.burst(word, this.caretX.x, this.typingY - this.lineHeight * 1.9, now, this.motionMul(), this.w);
     this.impact.kick(80 * this.motionMul());
     this.seismoFlashAt = now;
   }
@@ -1032,7 +1031,7 @@ export class Engine {
     // Every row is a lap, timed from its first key to the moment it is set.
     const chars = this.active.filter((g) => g.ch !== " ").length;
     const lapMs = this.active.length ? now - Math.min(...this.active.map((g) => g.born)) : 0;
-    this.race.lap(this.lines.length, this.colX(this.active.length), chars, lapMs, now);
+    this.cine.lap(this.lines.length, this.colX(this.active.length), chars, lapMs, now);
     this.lines.push({
       glyphs: this.active.map((g) => ({ ch: g.ch, w: Math.round(recordWeight(g.peak)) })),
       soft,
@@ -1052,6 +1051,7 @@ export class Engine {
     this.checkDoodle(now);
     this.recorder.note("\n", now);
     this.bakeActive(false, now);
+    this.cine.enter(this.motionMul());
     this.squash.kick(4.2 * this.motionMul());
     this.impact.kick(85 * this.motionMul());
     this.bumpStreak(now);
@@ -1360,7 +1360,7 @@ export class Engine {
     canUndo: boolean;
     rafSkew: number;
     blooms: number;
-    race: { gear: number; bursts: number; laps: number; zone: number };
+    cine: { focus: number; laps: number; zone: number; zoom: number };
     world: string | null;
   } {
     if (this.staticDirty) this.renumber();
@@ -1386,7 +1386,7 @@ export class Engine {
       canUndo: this.undoSlot !== null,
       rafSkew: this.rafSkew,
       blooms: this.blooms.length,
-      race: this.race.probe(),
+      cine: this.cine.probe(),
       world: this.worlds.id
     };
   }
@@ -1539,11 +1539,7 @@ export class Engine {
     this.captionPunch.target = 0;
     this.captionPunch.update(dt);
 
-    this.race.update(dt, t, this.emaWpm, t - this.lastInput < 1500, this.caretX.x, this.typingY, this.motionMul(), this.w, this.h);
-    if (this.race.pendingBurst) {
-      this.race.burst(this.race.pendingBurst, this.caretX.x, this.typingY - this.lineHeight * 1.9, t, this.motionMul(), this.w);
-      this.race.pendingBurst = null;
-    }
+    this.cine.update(dt, t, this.emaWpm, t - this.lastInput, this.caretX.x, this.typingY, this.lineHeight, this.motionMul(), this.w);
 
     this.persist(false);
     this.draw(t);
@@ -1554,7 +1550,7 @@ export class Engine {
   private present(now: number): void {
     const v = this.vctx;
     const p = this.palette();
-    const cam = this.race.camera(now);
+    const cam = this.cine.camera();
     v.setTransform(1, 0, 0, 1, 0, 0);
     v.globalAlpha = 1;
     v.globalCompositeOperation = "source-over";
@@ -1564,8 +1560,7 @@ export class Engine {
       const d = this.dpr;
       v.fillStyle = p.paper;
       v.fillRect(0, 0, this.view.width, this.view.height);
-      v.translate((cam.fx + cam.x) * d, (cam.fy + cam.y) * d);
-      v.rotate(cam.rot);
+      v.translate(cam.fx * d, cam.fy * d);
       v.scale(cam.s, cam.s);
       v.translate(-cam.fx * d, -cam.fy * d);
       v.drawImage(this.canvas, 0, 0);
@@ -1573,9 +1568,9 @@ export class Engine {
     v.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     const calm = this.helpOpen || this.statsOpen;
     const rowY = (row: number) => this.typingY - (this.lines.length - row) * this.lineHeight + this.lastSlide;
-    this.race.hud(
+    this.cine.hud(
       v,
-      { ink: p.ink, paper: p.paper, sub: p.sub, dark: p.dark },
+      { ink: p.ink, paper: p.paper, sub: p.sub, fresh: p.fresh, dark: p.dark },
       this.w,
       this.h,
       now,
@@ -1648,7 +1643,31 @@ export class Engine {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = this.inkAlpha;
     this.waves = this.waves.filter((w) => now - w.at < 1600);
-    if (this.waves.length === 0) {
+    const focus = this.cine.focus;
+    if (this.waves.length === 0 && focus > 0 && this.dofSoft) {
+      // Rack focus: lines further back sink into the paper and go soft,
+      // the way a lens set on the pen sees them. Only the band above the
+      // pen is touched.
+      const d = this.dpr;
+      const y = (slide + pageY + liftY) * d;
+      const W = this.staticCanvas.width;
+      // Each line back is a step further from the lens: it thins out...
+      let bottom = this.staticCanvas.height;
+      for (let k = 1; bottom > 0; k++) {
+        const top = Math.max(0, Math.round((this.typingY - (k + 0.7) * this.lineHeight) * d));
+        const m = clamp((k - 1.2) / 4, 0, 1);
+        ctx.globalAlpha = this.inkAlpha * (1 - 0.85 * focus * m);
+        if (bottom > top) ctx.drawImage(this.staticCanvas, 0, top, W, bottom - top, 0, top + y, W, bottom - top);
+        bottom = top;
+      }
+      // ...and a soft copy of it takes its place.
+      const near = (this.typingY - this.lineHeight * 1.4) * d + y;
+      ctx.globalAlpha = this.inkAlpha * focus;
+      ctx.imageSmoothingQuality = "high";
+      const src = this.dofSoft;
+      const sh = Math.min(src.height, Math.ceil((near - y) / (this.staticCanvas.height / src.height)));
+      if (sh > 0) ctx.drawImage(src, 0, 0, src.width, sh, 0, y, this.staticCanvas.width, sh * (this.staticCanvas.height / src.height));
+    } else if (this.waves.length === 0) {
       ctx.drawImage(this.staticCanvas, 0, (slide + pageY + liftY) * this.dpr);
     } else {
       // While a wave is passing, history is drawn in small tiles, each
@@ -1766,6 +1785,55 @@ export class Engine {
     s.fillRect(0, 0, this.w, fadeTop);
     s.globalCompositeOperation = "source-over";
     this.staticDirty = false;
+    this.buildFocus();
+  }
+
+  /**
+   * The two halves of depth of field, made once per history change: the
+   * history masked to the lines near the pen, and a blurred copy masked to
+   * the lines further back. Blur is a cheap downscale and upscale.
+   */
+  private buildFocus(): void {
+    if (this.motionMul() === 0) {
+      this.dofSoft = null;
+      return;
+    }
+    const W = this.staticCanvas.width;
+    const H = this.staticCanvas.height;
+    const make = (c: HTMLCanvasElement | null, w: number, h: number) => {
+      const out = c ?? document.createElement("canvas");
+      if (out.width !== w || out.height !== h) {
+        out.width = w;
+        out.height = h;
+      }
+      const x = out.getContext("2d")!;
+      x.setTransform(1, 0, 0, 1, 0, 0);
+      x.globalCompositeOperation = "source-over";
+      x.globalAlpha = 1;
+      x.clearRect(0, 0, w, h);
+      return [out, x] as const;
+    };
+    const d = this.dpr;
+    const near = (this.typingY - this.lineHeight * 1.4) * d;
+    const far = near - this.lineHeight * 4.5 * d;
+    const mask = (x: CanvasRenderingContext2D, soft: boolean, k = 1) => {
+      const g = x.createLinearGradient(0, far * k, 0, near * k);
+      g.addColorStop(0, soft ? "rgba(0,0,0,1)" : "rgba(0,0,0,0)");
+      g.addColorStop(1, soft ? "rgba(0,0,0,0)" : "rgba(0,0,0,1)");
+      x.globalCompositeOperation = "destination-in";
+      x.fillStyle = g;
+      x.fillRect(0, 0, x.canvas.width, x.canvas.height);
+      x.globalCompositeOperation = "source-over";
+    };
+    const [a, ax] = make(null, Math.max(1, Math.round(W / 3)), Math.max(1, Math.round(H / 3)));
+    ax.imageSmoothingQuality = "high";
+    ax.drawImage(this.staticCanvas, 0, 0, a.width, a.height);
+    // Kept small: drawing it back up to size is the rest of the blur.
+    const [soft, bx] = make(this.dofSoft, Math.max(1, Math.round(W / 7)), Math.max(1, Math.round(H / 7)));
+    bx.imageSmoothingQuality = "high";
+    bx.drawImage(a, 0, 0, soft.width, soft.height);
+    mask(bx, true, soft.height / H);
+    this.dofSoft = soft;
   }
 
   /** Where history must be gone by (clearTop) and starts to fade (fadeTop). */
@@ -2245,6 +2313,26 @@ export class Engine {
     const cw = Math.max(3, this.advance * 0.16);
     const chh = this.fs * 1.18;
     const yBottom = this.typingY + this.fs * 0.26;
+
+    // A light trail where the caret has just been: a ribbon that thins and
+    // fades behind it, longest on the carriage return.
+    this.trail.push({ x: this.caretX.x, t: now });
+    this.trail = this.trail.filter((p) => now - p.t < 180);
+    if (mm > 0 && this.trail.length > 2) {
+      const span = Math.abs(this.trail[this.trail.length - 1]!.x - this.trail[0]!.x);
+      if (span > this.advance * 0.6) {
+        ctx.fillStyle = fx.freshS;
+        for (let i = 1; i < this.trail.length; i++) {
+          const a0 = this.trail[i - 1]!;
+          const a1 = this.trail[i]!;
+          const life = 1 - (now - a1.t) / 180;
+          const hgt = chh * (0.25 + 0.75 * life) * sy;
+          ctx.globalAlpha = 0.22 * life * life * blink;
+          ctx.fillRect(Math.min(a0.x, a1.x), yBottom - chh * sy / 2 - hgt / 2, Math.abs(a1.x - a0.x) + cw, hgt);
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
 
     ctx.save();
     ctx.translate(this.caretX.x + 0.5, yBottom);

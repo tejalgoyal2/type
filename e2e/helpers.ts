@@ -29,7 +29,7 @@ export interface Probe {
   canUndo: boolean;
   rafSkew: number;
   blooms: number;
-  race: { gear: number; bursts: number; laps: number; zone: number };
+  cine: { focus: number; laps: number; zone: number; zoom: number };
   world: string | null;
 }
 

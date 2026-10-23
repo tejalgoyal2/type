@@ -150,14 +150,22 @@ test("a word opens a world, and the page keeps its own colors underneath", async
   expect(p.prefs.palette).not.toBe(0);
 });
 
-test("speed shifts gears, a line is a timed lap, and easing off shifts down", async ({ page }) => {
+test("the camera racks focus onto the pen, times each line, and lets go on a pause", async ({ page }) => {
   test.slow();
   await open(page, { prefs: { motion: 2 } });
-  // An even, quick cadence: about 100 wpm.
-  await page.keyboard.type("the quick brown fox jumps over the lazy dog and keeps on going", { delay: 115 });
-  await expect.poll(async () => (await probe(page)).race.gear, { timeout: 5000 }).toBeGreaterThan(3);
+  await page.keyboard.type("the quick brown fox jumps over the lazy dog and keeps on going", { delay: 100 });
   await page.keyboard.press("Enter");
-  expect((await probe(page)).race.laps).toBeGreaterThanOrEqual(1);
-  await page.waitForTimeout(3000);
-  await expect.poll(async () => (await probe(page)).race.gear, { timeout: 8000 }).toBe(1);
+  const p = await probe(page);
+  expect(p.cine.laps).toBeGreaterThanOrEqual(1);
+  expect(p.cine.focus).toBeGreaterThan(0.4);
+  expect(p.cine.zoom).toBeGreaterThan(1);
+  await expect.poll(async () => (await probe(page)).cine.focus, { timeout: 8000 }).toBe(0);
+});
+
+test("with motion off the camera never moves", async ({ page }) => {
+  await open(page, { prefs: { motion: 0 } });
+  await page.keyboard.type("still as a photograph\n", { delay: 30 });
+  const p = await probe(page);
+  expect(p.cine.focus).toBe(0);
+  expect(p.cine.zoom).toBe(1);
 });
