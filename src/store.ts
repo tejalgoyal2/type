@@ -60,11 +60,13 @@ function read<T>(key: string): T | null {
   }
 }
 
-function write(key: string, value: unknown): void {
+function write(key: string, value: unknown): boolean {
   try {
     localStorage.setItem(key, JSON.stringify(value));
+    return true;
   } catch {
     /* storage unavailable; live without it */
+    return false;
   }
 }
 
@@ -151,7 +153,7 @@ function unpackGlyphs(text: unknown, weights: unknown): SavedGlyph[] {
 }
 
 function marksOf(s: string): string[] {
-  return s.split(",").filter((m) => /^[a-z0-9]{1,16}$/.test(m)).slice(0, 2);
+  return s.split(",").filter((m) => /^[a-z0-9]{1,16}$/.test(m)).slice(0, 3);
 }
 
 function pack(sheet: SavedSheet): PackedSheet {
@@ -197,8 +199,8 @@ export function loadSheet(): SavedSheet | null {
 }
 
 export function saveSheet(sheet: SavedSheet): void {
-  write(SHEET_KEY, pack(sheet));
-  remove(SHEET_KEY_V1);
+  // Only drop the old copy once the new one is safely written.
+  if (write(SHEET_KEY, pack(sheet))) remove(SHEET_KEY_V1);
 }
 
 /** The last cleared sheet, kept so Ctrl+Z still works after a reload. */

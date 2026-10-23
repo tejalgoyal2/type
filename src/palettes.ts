@@ -236,8 +236,3 @@ export function css(c: RGB, a = 1): string {
   const b = Math.round(c[2]);
   return a >= 1 ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${a})`;
 }
-
-/** Mix two hex colors straight to a CSS string. */
-export function mixHex(a: string, b: string, t: number): string {
-  return css(mix(rgb(a), rgb(b), t));
-}

@@ -115,6 +115,8 @@ interface Sprite {
 }
 
 const SPRITE_CAP = 4;
+/** A margin holds three doodles. */
+const MARKS_PER_ROW = 3;
 /** The same doodle won't answer again for this long. */
 const DOODLE_COOLDOWN = 12000;
 
@@ -352,7 +354,10 @@ export class Engine {
     canvas.addEventListener("pointerdown", (e) => this.onPointer(e));
 
     const saved = loadSheet();
-    if (saved) this.restore(saved);
+    if (saved) {
+      this.restore(saved);
+      this.reflow();
+    }
     this.undoSlot = loadUndo();
     this.caretX.set(this.colX(this.caretIdx));
 
@@ -426,11 +431,102 @@ export class Engine {
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.font = this.font(460);
     this.advance = this.ctx.measureText("M").width;
-    this.maxCols = Math.max(10, Math.floor((this.w - 2 * this.marginX) / this.advance));
+    const cols = Math.max(10, Math.floor((this.w - 2 * this.marginX) / this.advance));
+    const changed = cols !== this.maxCols;
+    this.maxCols = cols;
+    if (changed) this.reflow();
 
     this.dotPattern = null;
     this.staticDirty = true;
     this.caretX.set(this.colX(this.caretIdx));
+  }
+
+  /**
+   * Rewrap the whole document at the current measure. Rows that wrapped
+   * at the margin rejoin into their logical line and wrap again, so a
+   * narrower window (or a sheet saved on a wider one) never leaves rows
+   * hanging past the margin. Margin doodles stay with their line.
+   */
+  private reflow(): void {
+    const now = performance.now();
+    // The active row and the soft rows before it are one logical line.
+    let tailStart = this.lines.length;
+    while (tailStart > 0 && this.lines[tailStart - 1]!.soft) tailStart--;
+    const tail = this.lines.slice(tailStart);
+    const head = this.lines.slice(0, tailStart);
+
+    const out: Line[] = [];
+    let buf: BakedGlyph[] = [];
+    let marks: string[] = [];
+    for (const l of head) {
+      buf = buf.concat(l.glyphs);
+      marks = marks.concat(l.marks);
+      if (!l.soft) {
+        this.pushWrapped(out, buf, marks, true);
+        buf = [];
+        marks = [];
+      }
+    }
+
+    const back = tail.flatMap((l) => l.glyphs.map((bg) => this.settledGlyph(bg, now)));
+    let active = back.concat(this.active);
+    let caret = back.length + this.caretIdx;
+    let tailMarks = tail.flatMap((l) => l.marks).concat(this.activeMarks);
+    const rows: Glyph[][] = [];
+    while (active.length > this.maxCols) {
+      const k = this.breakAt(active.map((g) => g.ch));
+      rows.push(active.slice(0, k));
+      active = active.slice(k);
+      caret = Math.max(0, caret - k);
+    }
+    rows.forEach((r) => {
+      out.push({
+        glyphs: r.map((g) => ({ ch: g.ch, w: Math.round(recordWeight(g.peak)) })),
+        soft: true,
+        marks: tailMarks.splice(0, MARKS_PER_ROW)
+      });
+    });
+    this.lines = out;
+    this.active = active;
+    this.caretIdx = Math.min(caret, active.length);
+    this.activeMarks = tailMarks.slice(0, MARKS_PER_ROW);
+    this.activeMarkAt = this.activeMarks.map(() => now - 60000);
+    this.sprites = [];
+    this.staticDirty = true;
+  }
+
+  /** Where a row longer than the measure should break: after its last space. */
+  private breakAt(chs: string[]): number {
+    for (let i = Math.min(this.maxCols, chs.length - 1); i > 0; i--) {
+      if (chs[i] === " ") return i + 1;
+    }
+    return this.maxCols;
+  }
+
+  private pushWrapped(out: Line[], gs: BakedGlyph[], marks: string[], hard: boolean): void {
+    const ms = marks.slice();
+    let rest = gs;
+    do {
+      const k = rest.length > this.maxCols ? this.breakAt(rest.map((g) => g.ch)) : rest.length;
+      const row = rest.slice(0, k);
+      rest = rest.slice(k);
+      out.push({ glyphs: row, soft: rest.length > 0 || !hard, marks: ms.splice(0, MARKS_PER_ROW) });
+    } while (rest.length > 0);
+  }
+
+  /** A committed glyph brought back to the active row, already dry. */
+  private settledGlyph(bg: BakedGlyph, now: number): Glyph {
+    return {
+      ch: bg.ch,
+      born: now - 60000,
+      upAt: now - 60000,
+      code: "",
+      cap: false,
+      peak: peakFromRecord(bg.w),
+      stampAt: null,
+      echoIdx: -1,
+      carry: null
+    };
   }
 
   private font(weight: number, px = this.fs): string {
@@ -694,6 +790,7 @@ export class Engine {
         break;
       case 6:
         this.prefs.caption = !this.prefs.caption;
+        this.staticDirty = true;
         this.toast(`Flow caption ${this.prefs.caption ? "on" : "off"}`);
         savePrefs(this.prefs);
         break;
@@ -710,6 +807,7 @@ export class Engine {
         break;
       case 9:
         this.prefs.chrome = !this.prefs.chrome;
+        this.staticDirty = true;
         this.toast(`Controls strip ${this.prefs.chrome ? "shown" : "hidden"}`);
         savePrefs(this.prefs);
         break;
@@ -754,17 +852,18 @@ export class Engine {
   // ------------------------------------------------------------- edits
 
   private insertChar(ch: string, code: string, now: number): void {
+    // The margin. Mid-line there is nowhere for the overflow to go, so the
+    // bell rings (silently) and the key is refused, like a carriage at its
+    // stop. At the end of the line the text wraps, carrying any unfinished
+    // word down with it.
+    const full = this.active.length >= this.maxCols;
+    if (full && this.caretIdx < this.active.length) {
+      this.bellAt = now;
+      this.squash.kick(-1.6 * this.motionMul());
+      return;
+    }
     if (ch === " ") this.checkDoodle(now);
-    if (this.active.length >= this.maxCols) {
-      // The margin. Mid-line there is nowhere for the overflow to go, so
-      // the bell rings (silently) and the key is refused, like a carriage
-      // at its stop. At the end of the line the text wraps, carrying any
-      // unfinished word down with it.
-      if (this.caretIdx < this.active.length) {
-        this.bellAt = now;
-        this.squash.kick(-1.6 * this.motionMul());
-        return;
-      }
+    if (full) {
       this.wrapLine(ch, now);
       if (ch === " ") {
         this.hasTyped = true;
@@ -946,7 +1045,7 @@ export class Engine {
     });
     if (this.sprites.length > SPRITE_CAP) this.sprites.shift();
     if (!this.activeMarks.includes(d.id)) {
-      if (this.activeMarks.length >= 2) {
+      if (this.activeMarks.length >= MARKS_PER_ROW) {
         this.activeMarks.shift();
         this.activeMarkAt.shift();
       }
@@ -969,11 +1068,11 @@ export class Engine {
    * itself into the page and the change blooms out from where it stood.
    */
   private secretLine(now: number): boolean {
+    // A word that merely wrapped onto its own row is still prose.
+    if (this.lines[this.lines.length - 1]?.soft) return false;
     const word = this.active.map((g) => g.ch).join("").trim().toLowerCase().replace(/\s+/g, " ");
     if (word === "lights out" || word === "box box") {
-      this.active = [];
-      this.caretIdx = 0;
-      this.dirtySheet = true;
+      this.spendLine();
       if (word === "lights out") {
         this.lights = { at: now, outAt: now + 4000 + 200 + Math.random() * 2800 };
         this.lightsWent = false;
@@ -1017,9 +1116,7 @@ export class Engine {
       }
       if (this.stamps.length > 24) this.stamps.splice(0, this.stamps.length - 24);
     }
-    this.active = [];
-    this.caretIdx = 0;
-    this.dirtySheet = true;
+    this.spendLine();
     this.impact.kick(70 * this.motionMul());
     this.squash.kick(4 * this.motionMul());
 
@@ -1037,10 +1134,22 @@ export class Engine {
       this.prefs.chrome = !anyOn;
       this.prefs.seismo = !anyOn;
       this.prefs.caption = !anyOn;
+      this.staticDirty = true;
       this.toast(anyOn ? "zen" : "welcome back");
       savePrefs(this.prefs);
     }
     return true;
+  }
+
+  /** A command line is spent: its words, and any doodles they drew, go. */
+  private spendLine(): void {
+    const row = this.lines.length;
+    this.active = [];
+    this.caretIdx = 0;
+    this.activeMarks = [];
+    this.activeMarkAt = [];
+    this.sprites = this.sprites.filter((sp) => sp.row !== row);
+    this.dirtySheet = true;
   }
 
   /**
@@ -1049,25 +1158,18 @@ export class Engine {
    */
   private unEnter(now: number): void {
     const prev = this.lines[this.lines.length - 1]!;
-    if (this.active.length > 0 && prev.glyphs.length + this.active.length > this.maxCols) {
+    if (
+      (this.active.length > 0 && prev.glyphs.length + this.active.length > this.maxCols) ||
+      prev.marks.length + this.activeMarks.length > MARKS_PER_ROW
+    ) {
       this.bellAt = now;
       this.squash.kick(-1.6 * this.motionMul());
       return;
     }
     this.lines.pop();
-    this.activeMarks = prev.marks.concat(this.activeMarks).slice(0, 2);
+    this.activeMarks = prev.marks.concat(this.activeMarks);
     this.activeMarkAt = this.activeMarks.map(() => now - 60000);
-    const back: Glyph[] = prev.glyphs.map((bg) => ({
-      ch: bg.ch,
-      born: now - 60000,
-      upAt: now - 60000,
-      code: "",
-      cap: false,
-      peak: peakFromRecord(bg.w),
-      stampAt: null,
-      echoIdx: -1,
-      carry: null
-    }));
+    const back = prev.glyphs.map((bg) => this.settledGlyph(bg, now));
     this.active = back.concat(this.active);
     this.caretIdx = back.length;
     this.caretX.set(this.colX(this.caretIdx));
@@ -1156,7 +1258,7 @@ export class Engine {
 
   private restore(s: SavedSheet): void {
     const now = performance.now();
-    const known = (ms: string[]) => ms.filter((m) => doodleById(m)).slice(0, 2);
+    const known = (ms: string[]) => ms.filter((m) => doodleById(m)).slice(0, MARKS_PER_ROW);
     this.lines = s.lines.map((l) => ({
       glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })),
       soft: l.soft,
@@ -1165,17 +1267,7 @@ export class Engine {
     this.activeMarks = known(s.activeMarks);
     this.activeMarkAt = this.activeMarks.map(() => now - 60000);
     this.sprites = [];
-    this.active = s.active.map((g) => ({
-      ch: g.ch,
-      born: now - 60000,
-      upAt: now - 60000,
-      code: "",
-      cap: false,
-      peak: peakFromRecord(g.w),
-      stampAt: null,
-      echoIdx: -1,
-      carry: null
-    }));
+    this.active = s.active.map((g) => this.settledGlyph(g, now));
     this.caretIdx = this.active.length;
   }
 
@@ -1245,18 +1337,10 @@ export class Engine {
       return;
     }
     const p = this.palette();
-    const glyphs: { ch: string; w: number }[] = [];
-    const marks: string[] = [];
-    for (const l of this.lines) {
-      for (const g of l.glyphs) glyphs.push(g);
-      if (!l.soft) glyphs.push({ ch: "\n", w: 400 });
-      marks.push(...l.marks);
-    }
-    const now = performance.now();
-    for (const g of this.active) {
-      glyphs.push({ ch: g.ch, w: Math.round(recordWeight(g.upAt === null ? this.glyphWeight(g, now) : g.peak)) });
-    }
-    marks.push(...this.activeMarks);
+    const sheet = this.serialize();
+    const glyphs = sheet.lines.flatMap((l) => (l.soft ? l.glyphs : [...l.glyphs, { ch: "\n", w: 400 }]));
+    glyphs.push(...sheet.active);
+    const marks = sheet.lines.flatMap((l) => l.marks).concat(sheet.activeMarks);
     const canvas = downloadRhythmPrint({
       echo: this.recorder.toEcho(),
       glyphs,
@@ -1453,16 +1537,31 @@ export class Engine {
     } else {
       // While a wave is passing, history is drawn in small tiles, each
       // pushed by the wave where it sits. Only the rows that hold ink.
+      // Only tiles the wave front is passing through move; every run of
+      // still tiles in a row is drawn as one span.
       const T = 18;
       const d = this.dpr;
       const top = Math.max(0, Math.floor(this.historyFade().clearTop / T) * T);
       const bottom = this.typingY;
       const off = slide + pageY + liftY;
+      const reach = 46 * 2.6 + T;
+      const fronts = this.waves.map((w) => ({ x: w.x, y: w.y, r: Math.max(0, now - w.at) * 0.95 }));
+      const span = (x0: number, x1: number, ty: number) => {
+        if (x1 > x0) ctx.drawImage(this.staticCanvas, x0 * d, ty * d, (x1 - x0) * d, T * d, x0 * d, (ty + off) * d, (x1 - x0) * d, T * d);
+      };
       for (let ty = top; ty < bottom; ty += T) {
+        let still = 0;
         for (let tx = 0; tx < this.w; tx += T) {
-          const [wx, wy] = this.waveAt(tx + T / 2, ty + off + T / 2, now);
+          const cx = tx + T / 2;
+          const cy = ty + off + T / 2;
+          const near = fronts.some((f) => Math.abs(Math.hypot(cx - f.x, cy - f.y) - f.r) < reach);
+          if (!near) continue;
+          span(still, tx, ty);
+          still = tx + T;
+          const [wx, wy] = this.waveAt(cx, cy, now);
           ctx.drawImage(this.staticCanvas, tx * d, ty * d, T * d, T * d, (tx + wx) * d, (ty + off + wy) * d, T * d, T * d);
         }
+        span(still, this.w, ty);
       }
     }
     ctx.restore();
@@ -2287,7 +2386,7 @@ export class Engine {
 
   /** Size of a margin doodle and where the k-th one sits on a row. */
   private markSize(): number {
-    return Math.min(this.fs * 0.7, this.marginX * 0.36);
+    return Math.min(this.fs * 0.7, this.marginX * 0.24);
   }
 
   /** Margin doodles sit side by side just past the text, never over it. */
