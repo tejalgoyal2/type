@@ -9,6 +9,10 @@ export interface Odometer {
   perKey: Record<string, number>;
   bestWpm: number;
   bestStreak: number;
+  /** Doodle ids found so far, in the order they were found. */
+  found: string[];
+  /** Most keys ever held down at once. */
+  bestRoll: number;
 }
 
 import type { StyleId } from "./styles";
@@ -31,11 +35,14 @@ export interface SavedLine {
   glyphs: SavedGlyph[];
   /** True when the line wrapped at the margin rather than ending in Enter. */
   soft: boolean;
+  /** Doodles drawn in this line's margin. */
+  marks: string[];
 }
 
 export interface SavedSheet {
   lines: SavedLine[];
   active: SavedGlyph[];
+  activeMarks: string[];
 }
 
 const ODO_KEY = "typef.odometer.v1";
@@ -75,7 +82,11 @@ export function loadOdometer(): Odometer {
     total: typeof o?.total === "number" ? o.total : 0,
     perKey: o?.perKey && typeof o.perKey === "object" ? o.perKey : {},
     bestWpm: typeof o?.bestWpm === "number" ? o.bestWpm : 0,
-    bestStreak: typeof o?.bestStreak === "number" ? o.bestStreak : 0
+    bestStreak: typeof o?.bestStreak === "number" ? o.bestStreak : 0,
+    found: Array.isArray(o?.found)
+      ? o.found.filter((id): id is string => typeof id === "string" && /^[a-z0-9]{1,16}$/.test(id))
+      : [],
+    bestRoll: typeof o?.bestRoll === "number" ? o.bestRoll : 0
   };
 }
 
@@ -112,7 +123,7 @@ export function savePrefs(prefs: Prefs): void {
  */
 const W64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-type PackedLine = [text: string, weights: string, soft?: 1];
+type PackedLine = [text: string, weights: string, soft?: 0 | 1, marks?: string];
 
 interface PackedSheet {
   v: 2;
@@ -139,14 +150,21 @@ function unpackGlyphs(text: unknown, weights: unknown): SavedGlyph[] {
   });
 }
 
+function marksOf(s: string): string[] {
+  return s.split(",").filter((m) => /^[a-z0-9]{1,16}$/.test(m)).slice(0, 2);
+}
+
 function pack(sheet: SavedSheet): PackedSheet {
   return {
     v: 2,
-    lines: sheet.lines.map((l) => {
+    lines: sheet.lines.map((l): PackedLine => {
       const [t, w] = packGlyphs(l.glyphs);
+      if (l.marks.length) return [t, w, l.soft ? 1 : 0, l.marks.join(",")];
       return l.soft ? [t, w, 1] : [t, w];
     }),
-    active: packGlyphs(sheet.active)
+    active: sheet.activeMarks.length
+      ? [...packGlyphs(sheet.active), 0, sheet.activeMarks.join(",")]
+      : packGlyphs(sheet.active)
   };
 }
 
@@ -155,8 +173,13 @@ function unpack(p: PackedSheet | null): SavedSheet | null {
   return {
     lines: p.lines
       .filter((l) => Array.isArray(l))
-      .map((l) => ({ glyphs: unpackGlyphs(l[0], l[1]), soft: l[2] === 1 })),
-    active: unpackGlyphs(p.active[0], p.active[1])
+      .map((l) => ({
+        glyphs: unpackGlyphs(l[0], l[1]),
+        soft: l[2] === 1,
+        marks: typeof l[3] === "string" ? marksOf(l[3]) : []
+      })),
+    active: unpackGlyphs(p.active[0], p.active[1]),
+    activeMarks: typeof p.active[3] === "string" ? marksOf(p.active[3]) : []
   };
 }
 
@@ -166,7 +189,11 @@ export function loadSheet(): SavedSheet | null {
   // One-time migration from the v1 format (glyph objects, no wrap flag).
   const v1 = read<{ lines: SavedGlyph[][]; active: SavedGlyph[] }>(SHEET_KEY_V1);
   if (!v1 || !Array.isArray(v1.lines) || !Array.isArray(v1.active)) return null;
-  return { lines: v1.lines.map((glyphs) => ({ glyphs, soft: false })), active: v1.active };
+  return {
+    lines: v1.lines.map((glyphs) => ({ glyphs, soft: false, marks: [] })),
+    active: v1.active,
+    activeMarks: []
+  };
 }
 
 export function saveSheet(sheet: SavedSheet): void {

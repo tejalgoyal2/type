@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { PNG } from "pngjs";
 import { open, probe, reload, expectText, MOD } from "./helpers";
 
 /** Watch every frame boundary for leaked canvas state on the stage. */
@@ -24,28 +25,32 @@ function leak(page: Page): Promise<{ depth: number; blur: number; frames: number
   );
 }
 
-/** Pixels of the stage canvas in CSS-pixel rect (x, y, w, h). */
+/**
+ * RGBA pixels of what is actually on screen in a CSS-pixel rect, read from
+ * a real screenshot (canvas readback is not reliable in every engine).
+ */
 async function pixels(page: Page, x: number, y: number, w: number, h: number): Promise<number[]> {
-  return page.evaluate(
-    ([x, y, w, h]) => {
-      const canvas = document.getElementById("stage") as HTMLCanvasElement;
-      const ctx = canvas.getContext("2d")!;
-      const s = canvas.width / window.innerWidth;
-      const d = ctx.getImageData(Math.round(x * s), Math.round(y * s), Math.round(w * s), Math.round(h * s));
-      return Array.from(d.data);
-    },
-    [x, y, w, h] as const
+  const png = PNG.sync.read(
+    await page.screenshot({ clip: { x, y, width: w, height: h }, scale: "css" })
   );
+  return Array.from(png.data);
 }
 
 test("canvas state never leaks between frames, in any style", async ({ page }) => {
+  test.slow();
   await open(page, { prefs: { style: "print" } });
   await watchCanvasState(page);
   // Type in flow (even cadence) through all six styles, so glow kicks in.
+  // Clicks send waves, words draw doodles, Ctrl+S pulls a proof: all of it
+  // has to leave the canvas clean.
   for (let s = 0; s < 6; s++) {
-    await page.keyboard.type("the quick brown fox jumps over the lazy dog ", { delay: 55 });
+    await page.keyboard.type("the quick brown fox jumps over the lazy dog under the sun ", { delay: 55 });
+    await page.mouse.click(300 + s * 40, 200);
     await page.keyboard.press("F4");
   }
+  await page.keyboard.type("lights out\n");
+  await page.keyboard.press(`${MOD}+s`);
+  await page.waitForTimeout(1200);
   const l = await leak(page);
   expect(l.frames).toBeGreaterThan(30);
   expect(l.depth).toBe(0);
@@ -189,6 +194,11 @@ test("history fades out before it reaches the controls", async ({ page }) => {
   await page.waitForTimeout(4500);
   const viewport = page.viewportSize()!;
   const withHistory = await pixels(page, 0, 0, viewport.width, 90);
+  // Sanity: history is really on screen lower down, so a blank read can't pass.
+  const below = await pixels(page, 0, layout.typingY - layout.lineHeight * 2, viewport.width, layout.lineHeight);
+  let dark = 0;
+  for (let i = 0; i < below.length; i += 4) if (below[i]! < 120) dark++;
+  expect(dark).toBeGreaterThan(50);
 
   await page.keyboard.down("Escape");
   await page.waitForTimeout(1000);

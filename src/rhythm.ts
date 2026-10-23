@@ -66,6 +66,25 @@ export class Rhythm {
     return { active, wpm, heat, even };
   }
 
+  /**
+   * Typing pace in WPM over a longer, steadier window than flow uses. Short
+   * bursts are measured over at least 2 s so one quick word doesn't read as
+   * 300 WPM.
+   */
+  pace(now: number, spanMs = 8000): number {
+    let n = 0;
+    let first = now;
+    for (let i = this.times.length - 1; i >= 0; i--) {
+      const t = this.times[i]!;
+      if (now - t > spanMs) break;
+      first = t;
+      n++;
+    }
+    if (n < 2) return 0;
+    const elapsed = Math.max(2000, now - first);
+    return ((n / elapsed) * 60000) / 5;
+  }
+
   /** Timestamps within the trailing span, oldest first. For the seismograph. */
   ticks(now: number, spanMs: number): number[] {
     const out: number[] = [];

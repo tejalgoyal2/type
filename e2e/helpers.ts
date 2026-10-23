@@ -3,6 +3,10 @@ import { expect, type Page } from "@playwright/test";
 export interface Probe {
   text: string;
   rows: string[];
+  marks: string[][];
+  activeMarks: string[];
+  found: string[];
+  bestRoll: number;
   active: string;
   activeLineNo: number;
   lineNos: number[];

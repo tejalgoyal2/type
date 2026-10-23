@@ -40,14 +40,21 @@ the instrument, the page just listens.
   Enter, and the style changes. Palettes answer to their names the same
   way, and zen hides the chrome. A word only counts when it stands alone,
   so ordinary sentences about water stay sentences.
+- Some words draw themselves. Finish a word like sun, coffee, rain, cube,
+  f1 or cat and a little pen drawing inks itself above it, does its one
+  thing (the sun turns, the bird flies off, the car takes the line like a
+  straight), then settles into that line's margin as a doodle. There are
+  42 to find; the odometer (F8) keeps a checklist that fills in as you go.
+- Click or tap the paper and a wave runs out through the printed letters.
 - Words wrap whole. When a word reaches the margin it hops down to the
   next line in one piece.
 - The writing surface. The page is a faint ruled sheet with a line under
   every row. The active line is a living horizon that lights up under the
   caret with every keystroke. Line numbers run down the left margin, and
   older lines fade out as they climb, gone before they reach the controls.
-- A comic-style caption shows your WPM only during sustained flow, then
-  gets out of the way.
+- A comic-style sticker shows your pace. Once you start it stays: live
+  while you type, holding your last pace when you pause, loudest in flow.
+  Roll three or more keys at once and it says so.
 - A seismograph in the bottom margin traces your last 12 seconds of rhythm.
 - A quiet controls strip sits top left. It dims while you type and F9
   hides it.
@@ -55,9 +62,15 @@ the instrument, the page just listens.
   the start of a line pulls the line above back down.
 - An odometer (F8) counts lifetime keystrokes, your most-pressed keys, your
   best flow and your longest streak.
-- Rhythm print. Ctrl+S saves the session as a poster: every keystroke is a
-  tick on a sunflower spiral, length for the gap before it, thickness for
-  how hard it was held. The same session always makes the same print.
+- The rhythm proof. Ctrl+S pulls a press proof of your session and it
+  slides out over the page. Its seal is a guilloche (banknote line-work)
+  made from how you typed: a rope whose lobes come from your pace, a
+  rosette woven from your cadence and steadiness, a ring that is your
+  actual keystroke gaps wrapped once around the circle, and a sunflower
+  of every keystroke at the center. Below it, your last words in the
+  weights you pressed, your margin doodles, a rhythm strip of the whole
+  session, crop marks and a colophon, with an edition number that is a
+  hash of the session. Same session, same proof.
 - Everything you write is kept, however long, and survives reloads. Hold
   Esc to clear the sheet; Ctrl+Z brings it back, even after a reload.
   Nothing leaves your browser.
@@ -79,7 +92,8 @@ Everything is keyboard-driven. The mouse is never needed.
 | hold Esc | Clear the sheet (a tap does nothing)                  |
 | Ctrl+Z   | Bring back the cleared sheet (press again to swap back) |
 | Ctrl+C   | Copy everything you typed                             |
-| Ctrl+S   | Save a rhythm print (PNG) of this session             |
+| Ctrl+S   | Pull a rhythm proof (PNG) of this session             |
+| click    | Send a ripple through the letters                     |
 
 F11 (browser fullscreen) is left to the browser on purpose; it makes the
 page better. Motion defaults to "subtle" if your OS asks for reduced motion.
@@ -168,9 +182,16 @@ DNS record automatically.
   gap, settled weight) for the rhythm print. Backspaces are not recorded.
 - The ink bloom freezes the previous frame and draws it over the new one
   through a growing, lobed hole, with a tide line stroked along its edge.
-- The rhythm print is a one-shot off-screen render: a phyllotaxis spiral
-  of ticks derived deterministically from the session, exported via
-  toDataURL. It never runs on the hot path.
+- Doodles are SVG path data on a 24 unit grid, stroked with Path2D and a
+  moving line dash so they draw on like a pen. Their motion is closed form
+  from age, like the glyphs. Margin doodles are stored with each line.
+- Click waves redraw the history layer in small tiles, each pushed by the
+  passing wave, only while a wave is alive.
+- The rhythm proof is a one-shot off-screen render (polar curves, a
+  phyllotaxis spiral, paper grain) encoded with toBlob. It never runs on
+  the hot path.
+- The render loop schedules its next frame before doing any work, so one
+  bad frame can never freeze the page.
 - All persistence is localStorage with try/catch guards; the site works
   fully without it. Sheets are stored compactly (text plus one character
   of weight per glyph), so long pieces fit easily.

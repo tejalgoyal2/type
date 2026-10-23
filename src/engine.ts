@@ -22,6 +22,16 @@ import { Rhythm } from "./rhythm";
 import { EchoRecorder } from "./echo";
 import { downloadRhythmPrint } from "./rhythmprint";
 import {
+  DOODLES,
+  DOODLE_DRAW,
+  DOODLE_LIFE,
+  doodleById,
+  doodleForWord,
+  doodlePaths,
+  pose,
+  type Doodle
+} from "./doodles";
+import {
   loadOdometer,
   saveOdometer,
   loadPrefs,
@@ -90,7 +100,23 @@ interface Line {
   glyphs: BakedGlyph[];
   /** Wrapped at the margin: the text continues on the next row, no newline. */
   soft: boolean;
+  /** Doodles that settled into this row's margin. */
+  marks: string[];
 }
+
+/** A doodle in the air: drawn by the pen, doing its thing, then settling. */
+interface Sprite {
+  d: Doodle;
+  x: number;
+  /** Document row it was written on, so it rides history up on Enter. */
+  row: number;
+  at: number;
+  seed: number;
+}
+
+const SPRITE_CAP = 4;
+/** The same doodle won't answer again for this long. */
+const DOODLE_COOLDOWN = 12000;
 
 /** Colors for the current palette and style, resolved once per change. */
 interface Tones {
@@ -200,6 +226,11 @@ export class Engine {
   /** Logical line number of each row (0 for a wrapped continuation). */
   private lineNos: number[] = [];
   private active: Glyph[] = [];
+  /** Doodles in the active row's margin, and when each arrived. */
+  private activeMarks: string[] = [];
+  private activeMarkAt: number[] = [];
+  private sprites: Sprite[] = [];
+  private doodleSeen = new Map<string, number>();
   private caretIdx = 0;
   private dying: Dying[] = [];
   private staticDirty = true;
@@ -219,6 +250,17 @@ export class Engine {
   private escLift: Spring;
   /** A refused keystroke at the margin flashes a silent bell. */
   private bellAt = -1e9;
+  /** Clicks send a wave through the printed letters. */
+  private waves: { x: number; y: number; at: number }[] = [];
+  /** Character keys physically down right now, for rollover. */
+  private keysDown = new Set<string>();
+  private rollPeak = 0;
+  private rollShownAt = -1e9;
+  /** "lights out": five reds, then go. */
+  private lights: { at: number; outAt: number } | null = null;
+  private lightsWent = false;
+  /** "box box": a pit stop that changes palette. */
+  private pitAt: number | null = null;
 
   // Streaks: consecutive content keys without backspace or a long pause.
   private streak = 0;
@@ -307,6 +349,7 @@ export class Engine {
       }
     });
     window.addEventListener("pagehide", () => this.persist(true));
+    canvas.addEventListener("pointerdown", (e) => this.onPointer(e));
 
     const saved = loadSheet();
     if (saved) this.restore(saved);
@@ -410,6 +453,7 @@ export class Engine {
       this.odo.perKey[e.code] = (this.odo.perKey[e.code] ?? 0) + 1;
       this.sessionKeys += 1;
       this.dirtyOdo = true;
+      if (key.length === 1 && !e.ctrlKey && !e.metaKey) this.noteRoll(e.code, now);
     }
     if (key === "Shift") this.shiftHeld = true;
 
@@ -512,6 +556,8 @@ export class Engine {
 
   private onKeyUp(e: KeyboardEvent): void {
     const now = performance.now();
+    this.keysDown.delete(e.code);
+    if (this.keysDown.size === 0) this.rollPeak = 0;
     if (e.key === "Shift") this.shiftHeld = false;
     if (e.key === "Backspace") this.bsHeld = false;
     if (e.key === "Escape" && this.escDownAt !== null) {
@@ -551,6 +597,8 @@ export class Engine {
    * weight they reached (no stamp: nobody released them on purpose).
    */
   private releaseAll(now: number): void {
+    this.keysDown.clear();
+    this.rollPeak = 0;
     this.bsHeld = false;
     this.shiftHeld = false;
     this.escDownAt = null;
@@ -560,6 +608,61 @@ export class Engine {
       g.upAt = now;
       if (g.echoIdx >= 0) this.recorder.setWeight(g.echoIdx, Math.round(recordWeight(g.peak)));
     }
+  }
+
+  /**
+   * Rollover. Fast hands hold several keys at once as they roll through a
+   * word; three or more at once gets a sticker, and the odometer keeps
+   * your biggest roll. NKRO keyboards finally get to show off.
+   */
+  private noteRoll(code: string, now: number): void {
+    this.keysDown.add(code);
+    const n = this.keysDown.size;
+    if (n <= this.rollPeak) return;
+    this.rollPeak = n;
+    if (n > this.odo.bestRoll) {
+      this.odo.bestRoll = n;
+      this.dirtyOdo = true;
+    }
+    if (n >= 3 && (n >= 4 || now - this.rollShownAt > 8000)) {
+      this.rollShownAt = now;
+      this.captionOverride = { text: `${n}-KEY ROLL`, until: now + 1100 };
+      this.captionPunch.kick(4);
+    }
+  }
+
+  /** A click or tap sends a wave out through the printed letters. */
+  private onPointer(e: PointerEvent): void {
+    if (this.helpOpen || this.statsOpen) {
+      this.helpOpen = false;
+      this.statsOpen = false;
+      return;
+    }
+    if (this.motionMul() === 0) return;
+    this.waves.push({ x: e.clientX, y: e.clientY, at: performance.now() });
+    if (this.waves.length > 3) this.waves.shift();
+  }
+
+  /**
+   * How far the click waves push a point right now: a ring travelling
+   * outward from each click, shoving letters away from it as it passes.
+   */
+  private waveAt(x: number, y: number, now: number): [number, number] {
+    let ox = 0;
+    let oy = 0;
+    for (const w of this.waves) {
+      const t = (now - w.at) / 1600;
+      if (t >= 1) continue;
+      const dx = x - w.x;
+      const dy = y - w.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const front = (now - w.at) * 0.95;
+      const u = (d - front) / 46;
+      const m = Math.exp(-u * u) * Math.sin(u * 2.2) * 10 * (1 - t) * (1 - t) * this.motionMul();
+      ox += (dx / d) * m;
+      oy += (dy / d) * m;
+    }
+    return [ox, oy];
   }
 
   private handleFn(n: number): void {
@@ -651,6 +754,7 @@ export class Engine {
   // ------------------------------------------------------------- edits
 
   private insertChar(ch: string, code: string, now: number): void {
+    if (ch === " ") this.checkDoodle(now);
     if (this.active.length >= this.maxCols) {
       // The margin. Mid-line there is nowhere for the overflow to go, so
       // the bell rings (silently) and the key is refused, like a carriage
@@ -789,8 +893,11 @@ export class Engine {
   private bakeActive(soft: boolean, now: number): void {
     this.lines.push({
       glyphs: this.active.map((g) => ({ ch: g.ch, w: Math.round(recordWeight(g.peak)) })),
-      soft
+      soft,
+      marks: this.activeMarks
     });
+    this.activeMarks = [];
+    this.activeMarkAt = [];
     this.active = [];
     this.caretIdx = 0;
     this.slideFrom = now;
@@ -800,12 +907,58 @@ export class Engine {
 
   private commitLine(now: number): void {
     if (this.secretLine(now)) return;
+    this.checkDoodle(now);
     this.recorder.note("\n", now);
     this.bakeActive(false, now);
     this.squash.kick(4.2 * this.motionMul());
     this.impact.kick(85 * this.motionMul());
     this.bumpStreak(now);
     this.spawnFor(this.caretX.x, this.typingY - this.fs * 0.35, now, 2);
+  }
+
+  /**
+   * Some words draw themselves. Reads the word just behind the caret (any
+   * trailing punctuation skipped) and, if it has a doodle, sends one up.
+   */
+  private checkDoodle(now: number): void {
+    let i = this.caretIdx - 1;
+    while (i >= 0 && /[.,!?;:'")\]]/.test(this.active[i]!.ch)) i--;
+    const end = i + 1;
+    let word = "";
+    for (; i >= 0 && word.length < 16; i--) {
+      const c = this.active[i]!.ch;
+      if (!/[a-zA-Z0-9]/.test(c)) break;
+      word = c.toLowerCase() + word;
+    }
+    if (word.length < 2) return;
+    const d = doodleForWord(word);
+    if (!d) return;
+    const last = this.doodleSeen.get(d.id) ?? -1e9;
+    if (now - last < DOODLE_COOLDOWN) return;
+    this.doodleSeen.set(d.id, now);
+    const start = end - word.length;
+    this.sprites.push({
+      d,
+      x: this.colX(start) + (word.length * this.advance) / 2,
+      row: this.lines.length,
+      at: now,
+      seed: Math.random()
+    });
+    if (this.sprites.length > SPRITE_CAP) this.sprites.shift();
+    if (!this.activeMarks.includes(d.id)) {
+      if (this.activeMarks.length >= 2) {
+        this.activeMarks.shift();
+        this.activeMarkAt.shift();
+      }
+      this.activeMarks.push(d.id);
+      this.activeMarkAt.push(now + DOODLE_LIFE - 500);
+      this.dirtySheet = true;
+    }
+    if (!this.odo.found.includes(d.id)) {
+      this.odo.found.push(d.id);
+      this.dirtyOdo = true;
+      this.toast(`found a doodle: ${d.id} · ${this.odo.found.length} of ${DOODLES.length}`);
+    }
   }
 
   /**
@@ -816,7 +969,20 @@ export class Engine {
    * itself into the page and the change blooms out from where it stood.
    */
   private secretLine(now: number): boolean {
-    const word = this.active.map((g) => g.ch).join("").trim().toLowerCase();
+    const word = this.active.map((g) => g.ch).join("").trim().toLowerCase().replace(/\s+/g, " ");
+    if (word === "lights out" || word === "box box") {
+      this.active = [];
+      this.caretIdx = 0;
+      this.dirtySheet = true;
+      if (word === "lights out") {
+        this.lights = { at: now, outAt: now + 4000 + 200 + Math.random() * 2800 };
+        this.lightsWent = false;
+      } else {
+        this.pitAt = now;
+        this.toast("box box");
+      }
+      return true;
+    }
     if (word.length < 3 || word.length > 12 || !/^[a-z]+$/.test(word)) return false;
 
     const styleAlias: Record<string, Prefs["style"]> = {
@@ -889,6 +1055,8 @@ export class Engine {
       return;
     }
     this.lines.pop();
+    this.activeMarks = prev.marks.concat(this.activeMarks).slice(0, 2);
+    this.activeMarkAt = this.activeMarks.map(() => now - 60000);
     const back: Glyph[] = prev.glyphs.map((bg) => ({
       ch: bg.ch,
       born: now - 60000,
@@ -922,6 +1090,9 @@ export class Engine {
 
     this.lines = [];
     this.active = [];
+    this.activeMarks = [];
+    this.activeMarkAt = [];
+    this.sprites = [];
     this.caretIdx = 0;
     this.staticDirty = true;
     this.dirtySheet = true;
@@ -970,17 +1141,30 @@ export class Engine {
   private serialize(): SavedSheet {
     const now = performance.now();
     return {
-      lines: this.lines.map((l) => ({ glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })), soft: l.soft })),
+      lines: this.lines.map((l) => ({
+        glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })),
+        soft: l.soft,
+        marks: l.marks.slice()
+      })),
       active: this.active.map((g) => ({
         ch: g.ch,
         w: Math.round(recordWeight(g.upAt === null ? this.glyphWeight(g, now) : g.peak))
-      }))
+      })),
+      activeMarks: this.activeMarks.slice()
     };
   }
 
   private restore(s: SavedSheet): void {
     const now = performance.now();
-    this.lines = s.lines.map((l) => ({ glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })), soft: l.soft }));
+    const known = (ms: string[]) => ms.filter((m) => doodleById(m)).slice(0, 2);
+    this.lines = s.lines.map((l) => ({
+      glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })),
+      soft: l.soft,
+      marks: known(l.marks)
+    }));
+    this.activeMarks = known(s.activeMarks);
+    this.activeMarkAt = this.activeMarks.map(() => now - 60000);
+    this.sprites = [];
     this.active = s.active.map((g) => ({
       ch: g.ch,
       born: now - 60000,
@@ -999,6 +1183,10 @@ export class Engine {
   probe(): {
     text: string;
     rows: string[];
+    marks: string[][];
+    activeMarks: string[];
+    found: string[];
+    bestRoll: number;
     active: string;
     activeLineNo: number;
     lineNos: number[];
@@ -1010,6 +1198,10 @@ export class Engine {
     return {
       text: this.text(),
       rows: this.lines.map((l) => l.glyphs.map((g) => g.ch).join("")),
+      marks: this.lines.map((l) => l.marks.slice()),
+      activeMarks: this.activeMarks.slice(),
+      found: this.odo.found.slice(),
+      bestRoll: this.odo.bestRoll,
       active: this.active.map((g) => g.ch).join(""),
       activeLineNo: this.activeLineNo(),
       lineNos: this.lineNos.slice(),
@@ -1049,26 +1241,82 @@ export class Engine {
 
   private exportPrint(): void {
     if (this.recorder.length < 8) {
-      this.toast("Type a little first, then Ctrl+S");
+      this.toast("type a little first, then Ctrl+S");
       return;
     }
     const p = this.palette();
-    const ok = downloadRhythmPrint(
-      this.recorder.toEcho(),
-      { paper: p.paper, ink: p.ink, fresh: p.fresh, sub: p.sub, misA: p.misA, misB: p.misB },
-      {
-        total: this.odo.total,
-        bestWpm: this.odo.bestWpm,
-        styleLabel: this.style().label,
-        paletteLabel: p.label
+    const glyphs: { ch: string; w: number }[] = [];
+    const marks: string[] = [];
+    for (const l of this.lines) {
+      for (const g of l.glyphs) glyphs.push(g);
+      if (!l.soft) glyphs.push({ ch: "\n", w: 400 });
+      marks.push(...l.marks);
+    }
+    const now = performance.now();
+    for (const g of this.active) {
+      glyphs.push({ ch: g.ch, w: Math.round(recordWeight(g.upAt === null ? this.glyphWeight(g, now) : g.peak)) });
+    }
+    marks.push(...this.activeMarks);
+    const canvas = downloadRhythmPrint({
+      echo: this.recorder.toEcho(),
+      glyphs,
+      marks,
+      pal: { paper: p.paper, ink: p.ink, fresh: p.fresh, sub: p.sub, misA: p.misA, misB: p.misB, dark: p.dark },
+      stats: { keys: this.recorder.length, styleLabel: this.style().label, paletteLabel: p.label }
+    });
+    if (canvas) {
+      this.proof = { canvas, at: performance.now() };
+      this.impact.kick(60 * this.motionMul());
+    }
+    this.toast(canvas ? "proof pulled. it's in your downloads" : "nothing to print yet");
+  }
+
+  /** The proof slides out over the page like a sheet off the press. */
+  private proof: { canvas: HTMLCanvasElement; at: number } | null = null;
+
+  private drawProof(p: Palette, now: number, mm: number): void {
+    const pr = this.proof!;
+    const t = now - pr.at;
+    const LIFE = 3000;
+    if (t > LIFE) {
+      this.proof = null;
+      return;
+    }
+    const ctx = this.ctx;
+    const sh = Math.min(this.h * 0.8, (this.w * 0.86) / 0.75);
+    const sw = sh * 0.75;
+    const x = (this.w - sw) / 2;
+    const rest = (this.h - sh) / 2;
+    let y = rest;
+    let a = 1;
+    if (mm > 0) {
+      const enter = clamp(t / 650, 0, 1);
+      const spring = 1 - Math.exp(-6 * enter) * Math.cos(7 * enter);
+      y = -sh + (rest + sh) * spring;
+      if (t > 2300) {
+        const out = easeOut((t - 2300) / 700);
+        y = rest + out * this.h * 0.9;
+        a = 1 - out;
       }
-    );
-    this.toast(ok ? "Rhythm print saved" : "Nothing to print yet");
+    } else {
+      a = t < 300 ? t / 300 : t > 2600 ? 1 - (t - 2600) / 400 : 1;
+    }
+    ctx.globalAlpha = 0.55 * Math.min(1, t / 250) * (t > 2300 ? 1 - clamp((t - 2300) / 700, 0, 1) : 1);
+    ctx.fillStyle = p.paper;
+    ctx.fillRect(0, 0, this.w, this.h);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.fillRect(x + 8, y + 12, sw, sh);
+    ctx.drawImage(pr.canvas, x, y, sw, sh);
+    ctx.globalAlpha = 1;
   }
 
   // ------------------------------------------------------------ frame
 
   private frame(t: number): void {
+    // Ask for the next frame first: if anything in this one throws, the
+    // page keeps living instead of freezing on the last good frame.
+    requestAnimationFrame((nt) => this.frame(nt));
     const dt = clamp((t - this.prev) / 1000, 0, 0.04);
     this.prev = t;
     this.dt = dt;
@@ -1100,6 +1348,21 @@ export class Engine {
       }
     }
 
+    if (this.lights && t >= this.lights.outAt && !this.lightsWent) {
+      this.lightsWent = true;
+      this.celebrate("AWAY WE GO", t);
+      this.toast("lights out and away we go");
+      const car = doodleById("car");
+      if (car) {
+        this.sprites.push({ d: car, x: this.caretX.x, row: this.lines.length, at: t - DOODLE_DRAW, seed: 0.5 });
+      }
+    }
+    if (this.pitAt !== null && t - this.pitAt >= 2300) {
+      this.pitAt = null;
+      this.cyclePalette(1);
+      this.toast(`pit stop: 2.3s. new tyres: ${this.palette().label.toLowerCase()}`);
+    }
+
     // Esc held long enough: the lifted sheet lets go.
     let escT = 0;
     if (this.escDownAt !== null) {
@@ -1126,7 +1389,6 @@ export class Engine {
 
     this.persist(false);
     this.draw(t);
-    requestAnimationFrame((nt) => this.frame(nt));
   }
 
   // ------------------------------------------------------------- draw
@@ -1179,14 +1441,32 @@ export class Engine {
     this.inkAlpha = 1 - clamp(lift, 0, 1) * 0.72;
 
     // Settled history (static layer), with the Enter slide.
-    if (this.staticDirty) this.rebuildStatic(p);
+    if (this.staticDirty) this.rebuildStatic(p, fx);
     const slideT = clamp((now - this.slideFrom) / 170, 0, 1);
     const slide = (1 - easeOut(slideT)) * this.lineHeight * mm;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = this.inkAlpha;
-    ctx.drawImage(this.staticCanvas, 0, (slide + pageY + liftY) * this.dpr);
+    this.waves = this.waves.filter((w) => now - w.at < 1600);
+    if (this.waves.length === 0) {
+      ctx.drawImage(this.staticCanvas, 0, (slide + pageY + liftY) * this.dpr);
+    } else {
+      // While a wave is passing, history is drawn in small tiles, each
+      // pushed by the wave where it sits. Only the rows that hold ink.
+      const T = 18;
+      const d = this.dpr;
+      const top = Math.max(0, Math.floor(this.historyFade().clearTop / T) * T);
+      const bottom = this.typingY;
+      const off = slide + pageY + liftY;
+      for (let ty = top; ty < bottom; ty += T) {
+        for (let tx = 0; tx < this.w; tx += T) {
+          const [wx, wy] = this.waveAt(tx + T / 2, ty + off + T / 2, now);
+          ctx.drawImage(this.staticCanvas, tx * d, ty * d, T * d, T * d, (tx + wx) * d, (ty + off + wy) * d, T * d, T * d);
+        }
+      }
+    }
     ctx.restore();
+    if (this.waves.length) this.drawWaveFronts(fx, now);
 
     this.drawRipples(fx, now, mm);
     this.drawParticles(fx, now);
@@ -1195,6 +1475,8 @@ export class Engine {
     ctx.translate(0, -liftY);
     this.inkAlpha = 1;
     this.drawStamps(fx, now, mm);
+    this.drawSprites(p, fx, now, mm, slide);
+    this.drawActiveMarks(fx, now);
     this.drawDying(fx, now);
     this.drawCaret(sd, fx, now, mm);
     if (lift > 0.001) this.drawEscHold(fx, lift);
@@ -1205,10 +1487,12 @@ export class Engine {
     this.drawWelcome(p, now);
     this.drawToast(p, now);
 
+    if (this.lights) this.drawLights(now, mm);
     if (this.bloom) this.drawBloom(fx, now, mm);
     if (this.wipe) this.drawWipe(now, mm);
+    if (this.proof) this.drawProof(p, now, mm);
     if (this.helpOpen) this.drawHelp(p, sd);
-    if (this.statsOpen) this.drawStats(p);
+    if (this.statsOpen) this.drawStats(p, fx);
   }
 
   /** Recompute logical line numbers (wrapped rows continue a number). */
@@ -1236,7 +1520,7 @@ export class Engine {
    * and is gone entirely before it reaches the controls and the sticker at
    * the top, so history never prints over them.
    */
-  private rebuildStatic(p: Palette): void {
+  private rebuildStatic(p: Palette, fx: Tones): void {
     this.renumber();
     const s = this.staticCtx;
     s.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -1248,8 +1532,14 @@ export class Engine {
     for (let row = 1; row <= n; row++) {
       const y = this.typingY - this.lineHeight * row;
       if (y < clearTop) break;
-      s.globalAlpha = clamp(1 - (row - 2) * 0.06, 0.35, 1);
-      this.drawBakedLine(s, this.lines[n - row]!.glyphs, y, p.ink);
+      const fade = clamp(1 - (row - 2) * 0.06, 0.35, 1);
+      s.globalAlpha = fade;
+      const line = this.lines[n - row]!;
+      this.drawBakedLine(s, line.glyphs, y, p.ink);
+      line.marks.forEach((id, k) => {
+        const d = doodleById(id);
+        if (d) this.drawMark(s, d, k, y, fx, fade * 0.8);
+      });
     }
     s.globalAlpha = 1;
     // Dissolve the top of the history into the paper.
@@ -1314,6 +1604,11 @@ export class Engine {
       let x = this.colX(i);
       let y = this.typingY;
       let xOff = 0;
+      if (this.waves.length) {
+        const [wx, wy] = this.waveAt(x + this.advance / 2, y - this.fs * 0.35, now);
+        x += wx;
+        y += wy;
+      }
 
       // A word carried down by the wrap hops from where it was.
       if (g.carry) {
@@ -1816,7 +2111,16 @@ export class Engine {
   }
 
   private captionA = 0;
+  /** Pace shown on the sticker; holds its last value while you pause. */
+  private shownWpm = 0;
+  private stickerHeat = 0;
 
+  /**
+   * The pace sticker. Once you start typing it stays: live while your hands
+   * are moving, holding your last pace when you pause, and loudest in flow
+   * (full slab, tilt and punch). Milestones take it over for a beat. F6
+   * hides it.
+   */
   private drawCaption(
     p: Palette,
     sd: StyleDef,
@@ -1827,17 +2131,19 @@ export class Engine {
       ? this.captionOverride
       : null;
     if (this.captionOverride && !override) this.captionOverride = null;
-    const flowOn =
-      override !== null ||
-      (this.prefs.caption && this.heat > 0.12 && this.emaWpm > 38 && now - this.lastInput < 900);
-    this.captionA += ((flowOn ? 1 : 0) - this.captionA) * (1 - Math.exp(-this.dt * 7.5));
+    const k = 1 - Math.exp(-this.dt * 7.5);
+    const typing = now - this.lastInput < 1500;
+    if (typing) this.shownWpm += (this.rhythm.pace(now) - this.shownWpm) * k;
+    const on = override !== null || (this.prefs.caption && this.hasTyped);
+    this.captionA += ((on ? 1 : 0) - this.captionA) * k;
+    this.stickerHeat += ((override || this.heat > 0.12 ? 1 : 0) - this.stickerHeat) * k * 0.6;
     if (this.captionA < 0.02) return;
     const print = sd.id === "print";
     void fx;
 
     const ctx = this.ctx;
     const fsC = Math.round(this.fs * 0.78);
-    const text = override ? override.text : `${Math.round(this.emaWpm)} WPM`;
+    const text = override ? override.text : `${Math.round(this.shownWpm)} WPM`;
     ctx.font = this.font(800, fsC);
     const tw = ctx.measureText(text).width;
     const pad = fsC * 0.7;
@@ -1845,18 +2151,20 @@ export class Engine {
     const bh = fsC * 1.9;
     const cx = this.w - this.marginX - bw / 2;
     const cy = 64;
+    const hot = this.stickerHeat;
 
     ctx.save();
-    ctx.globalAlpha = this.captionA;
+    // Calm when you pause, loud in flow.
+    ctx.globalAlpha = this.captionA * (typing || override ? 0.85 + 0.15 * hot : 0.85);
     ctx.translate(cx, cy);
-    ctx.rotate(-0.045);
+    ctx.rotate(-0.045 * (0.35 + 0.65 * hot));
     const punch = 1 + clamp(this.captionPunch.x, 0, 1.4) * 0.05;
     const popScale = (0.92 + 0.08 * this.captionA) * punch;
     ctx.scale(popScale, popScale);
 
     if (print) {
       ctx.fillStyle = p.ink;
-      ctx.fillRect(-bw / 2 + 4, -bh / 2 + 5, bw, bh);
+      ctx.fillRect(-bw / 2 + 1 + 3 * hot, -bh / 2 + 1 + 4 * hot, bw, bh);
     }
     ctx.fillStyle = p.captionBg;
     ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
@@ -1938,7 +2246,7 @@ export class Engine {
 
     ctx.font = this.font(460, small);
     const status = `${this.palette().label} · ${sd.label}`;
-    const controls = "F1 help   F4 style   hold Esc clear   Ctrl+S print";
+    const controls = "F1 help   F4 style   F8 doodles   hold Esc clear   Ctrl+S proof";
 
     ctx.globalAlpha = a;
     ctx.fillStyle = p.sub;
@@ -1977,6 +2285,195 @@ export class Engine {
     ctx.globalAlpha = 1;
   }
 
+  /** Size of a margin doodle and where the k-th one sits on a row. */
+  private markSize(): number {
+    return Math.min(this.fs * 0.7, this.marginX * 0.36);
+  }
+
+  /** Margin doodles sit side by side just past the text, never over it. */
+  private markX(k: number): number {
+    const s = this.markSize();
+    return this.w - this.marginX * 0.88 + s / 2 + k * s * 1.12;
+  }
+
+  /** A settled doodle in a row's right margin, baseline y. */
+  private drawMark(
+    c: CanvasRenderingContext2D,
+    d: Doodle,
+    k: number,
+    y: number,
+    fx: Tones,
+    alpha: number
+  ): void {
+    const size = this.markSize();
+    c.save();
+    c.globalAlpha = alpha;
+    this.strokeDoodle(c, d, this.markX(k), y - this.fs * 0.35, size, 1, fx, null, 1.3);
+    c.restore();
+  }
+
+  /**
+   * Ink a doodle centered on (cx, cy) at `size` px. `progress` 0..1 is how
+   * much of it the pen has drawn. With a paper color, a wide paper stroke
+   * goes down first so the doodle reads cleanly over text, like a sticker.
+   */
+  private strokeDoodle(
+    c: CanvasRenderingContext2D,
+    d: Doodle,
+    cx: number,
+    cy: number,
+    size: number,
+    progress: number,
+    fx: Tones,
+    paper: string | null,
+    strokePx: number
+  ): void {
+    const paths = doodlePaths(d);
+    const k = size / 24;
+    c.save();
+    c.translate(cx, cy);
+    c.scale(k, k);
+    c.translate(-12, -12);
+    c.lineCap = "round";
+    c.lineJoin = "round";
+    const dash = 96;
+    if (progress < 1) {
+      c.setLineDash([dash, dash]);
+      c.lineDashOffset = dash * (1 - progress);
+    }
+    if (paper) {
+      c.strokeStyle = paper;
+      c.lineWidth = (strokePx * 3.2) / k;
+      for (const ph of paths) c.stroke(ph);
+    }
+    const inks = [fx.freshS, fx.misAS, fx.misBS];
+    c.lineWidth = strokePx / k;
+    paths.forEach((ph, i) => {
+      c.strokeStyle = inks[Math.min(i, 2)]!;
+      c.stroke(ph);
+    });
+    if (d.fill && progress >= 1) {
+      const a = c.globalAlpha;
+      c.globalAlpha = a * 0.2;
+      c.fillStyle = fx.freshS;
+      c.fill(paths[0]!);
+      c.globalAlpha = a;
+    }
+    c.restore();
+  }
+
+  /**
+   * Doodles in the air. The pen draws each one above its word, it does its
+   * one thing, then it fades as its copy settles into the margin. They ride
+   * the history up when a line is committed.
+   */
+  private drawSprites(p: Palette, fx: Tones, now: number, mm: number, slide: number): void {
+    if (this.sprites.length === 0) return;
+    this.sprites = this.sprites.filter((sp) => now - sp.at < DOODLE_LIFE);
+    const ctx = this.ctx;
+    const size = this.fs * 1.55;
+    const unit = size / 24;
+    const { clearTop } = this.historyFade();
+    for (const sp of this.sprites) {
+      const t = now - sp.at;
+      const pz = pose(sp.d.motion, t, sp.seed, mm);
+      const rowsUp = this.lines.length - sp.row;
+      const shift = rowsUp > 0 ? -rowsUp * this.lineHeight + slide : 0;
+      const baseY = this.typingY - this.fs * 0.95 + shift;
+      const cy = pz.base ? baseY - size / 2 : baseY - size * 0.6;
+      if (cy < clearTop) continue;
+      const progress = mm > 0 ? clamp(t / DOODLE_DRAW, 0, 1) : 1;
+      const appear = mm > 0 ? 1 : clamp(t / 200, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = pz.alpha * appear;
+      ctx.translate(sp.x + pz.dx * unit, (pz.base ? baseY : cy) + pz.dy * unit);
+      ctx.rotate(pz.rot);
+      ctx.scale(pz.sx, pz.sy);
+      const oy = pz.base ? -size / 2 : 0;
+      this.drawSpriteExtras(sp.d, t, unit, oy, size, fx, mm);
+      this.strokeDoodle(ctx, sp.d, 0, oy, size, progress, fx, p.paper, Math.max(1.8, this.fs * 0.075));
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /** The little extra each moving doodle brings: rain, speed lines, exhaust. */
+  private drawSpriteExtras(
+    d: Doodle,
+    t: number,
+    unit: number,
+    oy: number,
+    size: number,
+    fx: Tones,
+    mm: number
+  ): void {
+    if (mm === 0 || t < DOODLE_DRAW) return;
+    const ctx = this.ctx;
+    const a = (t - DOODLE_DRAW) / 1000;
+    ctx.lineCap = "round";
+    if (d.motion === "fall") {
+      ctx.strokeStyle = fx.misAS;
+      ctx.lineWidth = 1.4;
+      for (let i = 0; i < 6; i++) {
+        const ph = (a * 1.4 + i / 6) % 1;
+        const x = (-7 + (i % 3) * 7 + (i > 2 ? 3 : 0)) * unit;
+        const y = oy + size * 0.3 + ph * size * 1.1;
+        ctx.globalAlpha = (1 - ph) * 0.8;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x - unit, y + unit * 2.4);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    } else if (d.motion === "drive") {
+      const v = Math.min(1, a * 1.5);
+      ctx.strokeStyle = fx.subS;
+      ctx.lineWidth = 1.4;
+      for (let i = 0; i < 3; i++) {
+        const y = oy + (2 + i * 3.5) * unit;
+        const len = (8 + i * 5) * unit * v * (1 + a * 2);
+        ctx.globalAlpha = 0.6 * v;
+        ctx.beginPath();
+        ctx.moveTo(-size * 0.55, y);
+        ctx.lineTo(-size * 0.55 - len, y);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    } else if (d.motion === "launch") {
+      ctx.fillStyle = fx.subS;
+      for (let i = 0; i < 5; i++) {
+        const ph = (a * 2.2 + i / 5) % 1;
+        ctx.globalAlpha = (1 - ph) * 0.5;
+        ctx.beginPath();
+        ctx.arc(Math.sin(i * 7) * 3 * unit * ph, oy + size * 0.45 + ph * size * 0.8, (1 + ph * 3) * unit, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else if (d.motion === "flash" && a < 0.25) {
+      ctx.globalAlpha = (1 - a / 0.25) * 0.35;
+      ctx.fillStyle = fx.misAS;
+      ctx.beginPath();
+      ctx.arc(0, oy, size * (0.6 + a * 2), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /** Doodles settling into the active row's margin. */
+  private drawActiveMarks(fx: Tones, now: number): void {
+    if (this.activeMarks.length === 0) return;
+    const ctx = this.ctx;
+    this.activeMarks.forEach((id, k) => {
+      const d = doodleById(id);
+      const since = now - this.activeMarkAt[k]!;
+      if (!d || since < 0) return;
+      ctx.save();
+      ctx.globalAlpha = clamp(since / 500, 0, 1) * 0.8 * this.inkAlpha;
+      this.strokeDoodle(ctx, d, this.markX(k), this.typingY - this.fs * 0.35, this.markSize(), clamp(since / 400, 0, 1), fx, null, 1.3);
+      ctx.restore();
+    });
+  }
+
   /**
    * Esc held: a hairline of fresh ink draws itself along the horizon, left
    * to right, as the sheet lifts. When it reaches the margin, the sheet goes.
@@ -1996,6 +2493,62 @@ export class Engine {
     ctx.lineTo(left + (right - left) * t, y);
     ctx.stroke();
     ctx.lineCap = "butt";
+    ctx.globalAlpha = 1;
+  }
+
+  /** The faint ring of each click wave, so it reads on empty paper too. */
+  private drawWaveFronts(fx: Tones, now: number): void {
+    const ctx = this.ctx;
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = 1.2;
+    for (const w of this.waves) {
+      const t = clamp((now - w.at) / 1600, 0, 1);
+      ctx.globalAlpha = 0.16 * (1 - t) * (1 - t);
+      ctx.beginPath();
+      ctx.arc(w.x, w.y, Math.max(0, now - w.at) * 0.95, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /**
+   * "lights out": a gantry of five reds lights up one a second, holds for
+   * a random beat, then everything goes out. Away we go.
+   */
+  private drawLights(now: number, mm: number): void {
+    const L = this.lights!;
+    const t = now - L.at;
+    const after = now - L.outAt;
+    if (after > 900) {
+      this.lights = null;
+      return;
+    }
+    const ctx = this.ctx;
+    const r = Math.max(9, this.fs * 0.42);
+    const gap = r * 2.7;
+    const cx = this.w / 2;
+    const cy = Math.max(r * 3, 70);
+    const fade = after > 0 ? 1 - after / 900 : Math.min(1, t / 200);
+    const drop = after > 0 && mm > 0 ? easeOut(after / 900) * -40 : 0;
+    ctx.globalAlpha = fade;
+    ctx.fillStyle = "#16161a";
+    const bw = gap * 5;
+    ctx.beginPath();
+    ctx.roundRect(cx - bw / 2, cy - r * 1.6 + drop, bw, r * 3.2, r * 0.6);
+    ctx.fill();
+    for (let i = 0; i < 5; i++) {
+      const lit = after < 0 && t >= i * 1000;
+      const x = cx - bw / 2 + gap * (i + 0.5);
+      if (lit) {
+        ctx.shadowColor = "#ff2a1a";
+        ctx.shadowBlur = r * 1.6;
+      }
+      ctx.fillStyle = lit ? "#ff2a1a" : "#3a3a40";
+      ctx.beginPath();
+      ctx.arc(x, cy + drop, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
     ctx.globalAlpha = 1;
   }
 
@@ -2114,11 +2667,11 @@ export class Engine {
   private overlayPanel(p: Palette): { x: number; y: number; pw: number } {
     const ctx = this.ctx;
     ctx.fillStyle = p.paper;
-    ctx.globalAlpha = 0.94;
+    ctx.globalAlpha = 0.97;
     ctx.fillRect(0, 0, this.w, this.h);
     ctx.globalAlpha = 1;
-    const pw = Math.min(620, this.w - 64);
-    return { x: (this.w - pw) / 2, y: Math.max(56, this.h * 0.14), pw };
+    const pw = Math.min(1000, this.w - 64);
+    return { x: (this.w - pw) / 2, y: Math.max(56, this.h * 0.12), pw };
   }
 
   private drawHelp(p: Palette, sd: StyleDef): void {
@@ -2140,7 +2693,8 @@ export class Engine {
       ["hold Esc", "clear the page"],
       ["Ctrl+Z", "bring back what you cleared, even after a reload"],
       ["Ctrl+C", "copy everything you typed"],
-      ["Ctrl+S", "save a print of your session"]
+      ["Ctrl+S", "pull a rhythm proof of your session"],
+      ["click", "send a ripple through the letters"]
     ];
 
     const aboutLines = [
@@ -2153,7 +2707,8 @@ export class Engine {
       "hold, then release: the letter stamps. feel the thump.",
       "type with an even rhythm and the page warms up to it.",
       "fire, water, ice, wind or zen alone on a line, then Enter.",
-      "Ctrl+S saves a print of your rhythm."
+      "some words draw themselves. F8 shows the ones you've found.",
+      "Ctrl+S pulls a proof, sealed with your rhythm."
     ];
 
     // Adaptive type size: fit by height AND by the widest line, so the
@@ -2232,14 +2787,14 @@ export class Engine {
     for (const line of inkLines) body(line);
   }
 
-  private drawStats(p: Palette): void {
+  private drawStats(p: Palette, fx: Tones): void {
     const ctx = this.ctx;
-    const { x, y } = this.overlayPanel(p);
-    const small = Math.round(this.fs * 0.6);
+    const { x, y, pw } = this.overlayPanel(p);
+    const small = Math.round(Math.min(this.fs * 0.6, (this.h - y) / 26));
     let cy = y;
 
     ctx.fillStyle = p.ink;
-    ctx.font = this.font(760, Math.round(this.fs * 1.5));
+    ctx.font = this.font(760, Math.round(small * 2.5));
     ctx.fillText("odometer", x, cy);
     cy += small * 3.4;
 
@@ -2248,7 +2803,8 @@ export class Engine {
       ["lifetime keystrokes", fmt(this.odo.total)],
       ["this session", fmt(this.sessionKeys)],
       ["best flow", this.odo.bestWpm ? `${this.odo.bestWpm} WPM` : "not yet"],
-      ["longest streak", this.odo.bestStreak ? fmt(this.odo.bestStreak) : "not yet"]
+      ["longest streak", this.odo.bestStreak ? fmt(this.odo.bestStreak) : "not yet"],
+      ["biggest roll", this.odo.bestRoll >= 3 ? `${this.odo.bestRoll} keys at once` : "not yet"]
     ];
     for (const [label, val] of rows) {
       ctx.font = this.font(440, small);
@@ -2256,11 +2812,14 @@ export class Engine {
       ctx.fillText(label, x, cy);
       ctx.font = this.font(660, small);
       ctx.fillStyle = p.ink;
-      ctx.fillText(val, x + small * 14, cy);
+      ctx.fillText(val, x + small * 12, cy);
       cy += small * 1.95;
     }
 
-    cy += small * 1.4;
+    // Two columns when there is room: keys on the left, doodles on the right.
+    const wide = pw >= 900;
+    const colY = cy + small * 1.4;
+    cy = colY;
     ctx.font = this.font(440, small);
     ctx.fillStyle = p.sub;
     ctx.fillText("most pressed", x, cy);
@@ -2274,7 +2833,7 @@ export class Engine {
       ctx.font = this.font(660, small);
       ctx.fillStyle = p.fresh;
       ctx.fillText(keyLabel(code), x, cy);
-      const barW = (count / maxCount) * small * 12;
+      const barW = (count / maxCount) * small * 10;
       ctx.fillStyle = p.sub;
       ctx.globalAlpha = 0.5;
       ctx.fillRect(x + small * 6, cy - small * 0.62, barW, small * 0.7);
@@ -2284,5 +2843,31 @@ export class Engine {
       ctx.fillText(fmt(count), x + small * 6 + barW + small * 0.6, cy);
       cy += small * 1.95;
     }
+
+    // The doodle checklist: found ones drawn, the rest still a secret.
+    const gx = wide ? x + pw * 0.52 : x;
+    let gy = wide ? colY : cy + small * 1.2;
+    const found = new Set(this.odo.found);
+    ctx.font = this.font(440, small);
+    ctx.fillStyle = p.sub;
+    ctx.fillText(`doodles found  ${found.size} of ${DOODLES.length}`, gx, gy);
+    gy += small * 1.2;
+    const gw = wide ? pw * 0.48 : pw;
+    const perRow = wide ? 7 : Math.max(7, Math.floor(gw / (small * 2.4)));
+    const cell = Math.min(small * 2.6, gw / perRow);
+    DOODLES.forEach((d, i) => {
+      const cx = gx + (i % perRow) * cell + cell / 2;
+      const ccy = gy + Math.floor(i / perRow) * cell + cell / 2;
+      if (found.has(d.id)) {
+        this.strokeDoodle(ctx, d, cx, ccy, cell * 0.66, 1, fx, null, 1.4);
+      } else {
+        ctx.fillStyle = p.sub;
+        ctx.globalAlpha = 0.5;
+        ctx.beginPath();
+        ctx.arc(cx, ccy, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    });
   }
 }
