@@ -28,6 +28,7 @@ jobs:
   e2e:
     # Chromium and WebKit, desktop and phone sizes, plus reduced motion.
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +41,7 @@ jobs:
         run: npm ci
 
       - name: Install browsers
+        timeout-minutes: 8
         run: npx playwright install --with-deps chromium webkit
 
       - name: End-to-end tests
