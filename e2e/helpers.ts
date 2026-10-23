@@ -28,6 +28,7 @@ export interface Probe {
   };
   canUndo: boolean;
   rafSkew: number;
+  blooms: number;
 }
 
 declare global {

@@ -61,6 +61,7 @@ const ESC_HOLD_MS = 650;
 const CARRY_MS = 260;
 /** Palette and style changes bloom out from where they were asked for. */
 const BLOOM_MS = 1250;
+const BLOOM_CAP = 4;
 
 interface Glyph {
   ch: string;
@@ -245,7 +246,11 @@ export class Engine {
   private captionPunch: Spring;
   private slideFrom = -1e9;
   private wipe: { canvas: HTMLCanvasElement; at: number } | null = null;
-  private bloom: Bloom | null = null;
+  /** Blooms in flight, oldest first. Each keeps spreading on its own. */
+  private blooms: Bloom[] = [];
+  /** The last frame without any bloom on it, kept only while blooms run. */
+  private bare: HTMLCanvasElement | null = null;
+  private spare: HTMLCanvasElement[] = [];
   private stamps: Stamp[] = [];
   /** Esc held down: the sheet lifts as you hold, and clears at the top. */
   private escDownAt: number | null = null;
@@ -844,16 +849,23 @@ export class Engine {
    * on damp paper, with a darker tide line at its edge.
    */
   private startBloom(x: number, y: number): void {
-    const prev = this.bloom?.canvas;
-    const snap = prev && prev.width === this.canvas.width && prev.height === this.canvas.height
-      ? prev
-      : document.createElement("canvas");
-    snap.width = this.canvas.width;
-    snap.height = this.canvas.height;
+    // Snapshot the page as it looked under any blooms already running, so
+    // a quick second change spreads over the first instead of cutting it off.
+    const src = this.blooms.length && this.bare ? this.bare : this.canvas;
+    const snap = this.blankCanvas();
     const sc = snap.getContext("2d");
     if (!sc) return;
-    sc.drawImage(this.canvas, 0, 0);
-    this.bloom = { canvas: snap, at: performance.now(), x, y, seed: Math.random() * 1000 };
+    sc.drawImage(src, 0, 0);
+    this.blooms.push({ canvas: snap, at: performance.now(), x, y, seed: Math.random() * 1000 });
+    // Each snapshot is a full screen of pixels: keep only a few in flight.
+    while (this.blooms.length > BLOOM_CAP) this.spare.push(this.blooms.shift()!.canvas);
+  }
+
+  private blankCanvas(): HTMLCanvasElement {
+    const c = this.spare.pop() ?? document.createElement("canvas");
+    c.width = this.canvas.width;
+    c.height = this.canvas.height;
+    return c;
   }
 
   // ------------------------------------------------------------- edits
@@ -1293,6 +1305,7 @@ export class Engine {
     layout: { marginX: number; typingY: number; advance: number; fs: number; lineHeight: number; maxCols: number };
     canUndo: boolean;
     rafSkew: number;
+    blooms: number;
   } {
     if (this.staticDirty) this.renumber();
     return {
@@ -1315,7 +1328,8 @@ export class Engine {
         maxCols: this.maxCols
       },
       canUndo: this.undoSlot !== null,
-      rafSkew: this.rafSkew
+      rafSkew: this.rafSkew,
+      blooms: this.blooms.length
     };
   }
 
@@ -1601,7 +1615,7 @@ export class Engine {
     this.drawToast(p, now);
 
     if (this.lights) this.drawLights(now, mm);
-    if (this.bloom) this.drawBloom(fx, now, mm);
+    if (this.blooms.length) this.drawBlooms(fx, now, mm);
     if (this.wipe) this.drawWipe(now, mm);
     if (this.proof) this.drawProof(p, now, mm);
     if (this.helpOpen) this.drawHelp(p, sd);
@@ -2686,28 +2700,83 @@ export class Engine {
   }
 
   /**
-   * The ink bloom. The frame from before the change is drawn on top with a
-   * hole in it, and the hole grows: an irregular, slightly lobed blot, the
-   * way a drop spreads through damp paper, with a darker tide line where
-   * the wet edge is. Without motion it is a plain cross-fade.
+   * The ink blooms. Each frame from before a change is drawn on top with a
+   * growing hole in it, and a darker tide line where the wet edge is. Quick
+   * changes stack: every bloom keeps spreading, the newest on top. Without
+   * motion it is a plain cross-fade.
    */
-  private drawBloom(fx: Tones, now: number, mm: number): void {
-    const b = this.bloom!;
+  private drawBlooms(fx: Tones, now: number, mm: number): void {
     const ctx = this.ctx;
     const dur = mm >= 1 ? BLOOM_MS : mm > 0 ? BLOOM_MS * 0.7 : 280;
-    const t = (now - b.at) / dur;
-    if (t >= 1) {
-      this.bloom = null;
+    // A finished bloom covers the whole page, so anything older is hidden.
+    for (let i = this.blooms.length - 1; i >= 0; i--) {
+      if (now - this.blooms[i]!.at >= dur) {
+        for (const b of this.blooms.splice(0, i + 1)) this.spare.push(b.canvas);
+        break;
+      }
+    }
+    if (!this.blooms.length) {
+      this.bare = null;
       return;
     }
+    // Keep this frame clean of blooms, for the next change to start from.
+    if (!this.bare || this.bare.width !== this.canvas.width || this.bare.height !== this.canvas.height) {
+      this.bare = document.createElement("canvas");
+      this.bare.width = this.canvas.width;
+      this.bare.height = this.canvas.height;
+    }
+    const bc = this.bare.getContext("2d");
+    if (bc) {
+      bc.clearRect(0, 0, this.bare.width, this.bare.height);
+      bc.drawImage(this.canvas, 0, 0);
+    }
+
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     if (mm === 0) {
-      ctx.globalAlpha = 1 - t;
-      ctx.drawImage(b.canvas, 0, 0);
+      for (const b of this.blooms) {
+        ctx.globalAlpha = 1 - (now - b.at) / dur;
+        ctx.drawImage(b.canvas, 0, 0);
+      }
       ctx.restore();
       return;
     }
+    // Newest first: each older page shows only outside every newer blot,
+    // so the clips stack up as we go back in time.
+    const blots: { path: Path2D; t: number }[] = [];
+    for (let i = this.blooms.length - 1; i >= 0; i--) {
+      const b = this.blooms[i]!;
+      const t = (now - b.at) / dur;
+      const blot = this.blot(b, t);
+      const hole = new Path2D();
+      hole.rect(0, 0, this.canvas.width, this.canvas.height);
+      hole.addPath(blot);
+      ctx.clip(hole, "evenodd");
+      ctx.drawImage(b.canvas, 0, 0);
+      blots.push({ path: blot, t });
+    }
+    ctx.restore();
+
+    // The tide lines: wet ink pools at the edge of each spread.
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.strokeStyle = fx.freshS;
+    for (const { path, t } of blots) {
+      ctx.globalAlpha = 0.5 * (1 - t) * (1 - t);
+      ctx.lineWidth = (1.5 + 5 * (1 - t)) * this.dpr;
+      ctx.stroke(path);
+      ctx.globalAlpha = 0.18 * (1 - t);
+      ctx.lineWidth = (8 + 18 * (1 - t)) * this.dpr;
+      ctx.stroke(path);
+    }
+    ctx.restore();
+  }
+
+  /**
+   * One bloom's edge at progress t: an irregular, slightly lobed blot, the
+   * way a drop spreads through damp paper. In device pixels.
+   */
+  private blot(b: Bloom, t: number): Path2D {
     // Reach: far enough to cover the farthest corner, with lobes to spare.
     const reach =
       Math.hypot(Math.max(b.x, this.w - b.x), Math.max(b.y, this.h - b.y)) * 1.18;
@@ -2731,24 +2800,7 @@ export class Engine {
       else blot.lineTo(px, py);
     }
     blot.closePath();
-
-    const hole = new Path2D();
-    hole.rect(0, 0, this.canvas.width, this.canvas.height);
-    hole.addPath(blot);
-    ctx.save();
-    ctx.clip(hole, "evenodd");
-    ctx.drawImage(b.canvas, 0, 0);
-    ctx.restore();
-
-    // The tide line: wet ink pools at the edge of the spread.
-    ctx.globalAlpha = 0.5 * (1 - t) * (1 - t);
-    ctx.strokeStyle = fx.freshS;
-    ctx.lineWidth = (1.5 + 5 * (1 - t)) * this.dpr;
-    ctx.stroke(blot);
-    ctx.globalAlpha = 0.18 * (1 - t);
-    ctx.lineWidth = (8 + 18 * (1 - t)) * this.dpr;
-    ctx.stroke(blot);
-    ctx.restore();
+    return blot;
   }
 
   private drawHalftoneBands(p: Palette): void {

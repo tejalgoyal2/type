@@ -114,3 +114,15 @@ test("a space refused at the margin draws nothing", async ({ page }) => {
   expect(p.activeMarks).toEqual([]);
   expect(p.active.length).toBe(layout.maxCols);
 });
+
+test("quick palette changes stack their blooms instead of cutting each other off", async ({ page }) => {
+  await open(page, { prefs: { motion: 2 } });
+  await page.keyboard.type("ink");
+  await page.keyboard.press("F2");
+  await page.waitForTimeout(150);
+  await page.keyboard.press("F2");
+  await page.waitForTimeout(150);
+  await page.keyboard.press("F2");
+  expect((await probe(page)).blooms).toBe(3);
+  await expect.poll(async () => (await probe(page)).blooms, { timeout: 4000 }).toBe(0);
+});
