@@ -11,12 +11,14 @@
     "dev": "vite",
     "check": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "playwright test"
   },
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.2.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.56.1",
     "typescript": "^5.8.0",
     "vite": "^6.3.0"
   }

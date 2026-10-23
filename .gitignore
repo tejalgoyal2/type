@@ -25,3 +25,7 @@ Thumbs.db
 *.local
 *.swp
 *.swo
+
+# Playwright output
+test-results/
+playwright-report/
