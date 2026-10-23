@@ -73,11 +73,14 @@ test("ember lands hot on light paper", async ({ page }) => {
   // and green well above blue too. Dried ink is near black, the quiet grey
   // and the reddish rule tint both have green close to blue.
   let orange = 0;
+  let darkest = [255, 255, 255];
   for (let i = 0; i < px.length; i += 4) {
     const [r, g, b] = [px[i]!, px[i + 1]!, px[i + 2]!];
     if (r - b > 50 && g - b > 30) orange++;
+    if (r + g + b < darkest[0]! + darkest[1]! + darkest[2]!) darkest = [r, g, b];
   }
-  expect(orange).toBeGreaterThan(20);
+  const { rafSkew } = await probe(page);
+  expect(orange, `darkest ink rgb(${darkest.join(",")}), rAF skew ${Math.round(rafSkew)} ms`).toBeGreaterThan(20);
 });
 
 test("a long piece survives: copy, line numbers and reload keep every line", async ({ page }) => {

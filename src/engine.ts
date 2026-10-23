@@ -296,6 +296,8 @@ export class Engine {
   private tonesKey = "";
   private tonesCache: Tones | null = null;
   private dt = 1 / 60;
+  /** How far the rAF timestamp sits from performance.now(), for the tests. */
+  private rafSkew = 0;
 
   // Overlays and chrome
   private helpOpen = false;
@@ -1285,6 +1287,7 @@ export class Engine {
     prefs: Prefs;
     layout: { marginX: number; typingY: number; advance: number; fs: number; lineHeight: number; maxCols: number };
     canUndo: boolean;
+    rafSkew: number;
   } {
     if (this.staticDirty) this.renumber();
     return {
@@ -1306,7 +1309,8 @@ export class Engine {
         lineHeight: this.lineHeight,
         maxCols: this.maxCols
       },
-      canUndo: this.undoSlot !== null
+      canUndo: this.undoSlot !== null,
+      rafSkew: this.rafSkew
     };
   }
 
@@ -1397,10 +1401,15 @@ export class Engine {
 
   // ------------------------------------------------------------ frame
 
-  private frame(t: number): void {
+  private frame(rafT: number): void {
     // Ask for the next frame first: if anything in this one throws, the
     // page keeps living instead of freezing on the last good frame.
     requestAnimationFrame((nt) => this.frame(nt));
+    // One clock for everything. Keystrokes are stamped with
+    // performance.now(), so frames are too; the rAF timestamp is not
+    // guaranteed to sit on the same timeline in every engine.
+    const t = performance.now();
+    this.rafSkew = rafT - t;
     const dt = clamp((t - this.prev) / 1000, 0, 0.04);
     this.prev = t;
     this.dt = dt;

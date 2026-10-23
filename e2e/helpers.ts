@@ -27,6 +27,7 @@ export interface Probe {
     maxCols: number;
   };
   canUndo: boolean;
+  rafSkew: number;
 }
 
 declare global {
