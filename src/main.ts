@@ -19,7 +19,11 @@ async function boot(): Promise<void> {
   const timeout = new Promise((resolve) => setTimeout(resolve, 2500));
   await Promise.race([fonts, timeout]);
 
-  new Engine(canvas);
+  const engine = new Engine(canvas);
+  // The end-to-end tests read state through this; nothing else does.
+  if (new URLSearchParams(location.search).has("probe")) {
+    (window as unknown as { __type: Engine }).__type = engine;
+  }
 }
 
 void boot();

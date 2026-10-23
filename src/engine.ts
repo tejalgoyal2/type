@@ -15,12 +15,22 @@
  *   finish's ink misregistration, and the comic flow caption.
  * - every keystroke ticks the seismograph in the bottom margin.
  */
-import { PALETTES, mixHex, type Palette } from "./palettes";
+import { PALETTES, rgb, mix, css, type Palette, type RGB } from "./palettes";
 import { styleOf, STYLES, type StyleDef } from "./styles";
 import { Spring, landCurve, clamp, lerp, easeOut } from "./springs";
 import { Rhythm } from "./rhythm";
 import { EchoRecorder } from "./echo";
 import { downloadRhythmPrint } from "./rhythmprint";
+import {
+  DOODLES,
+  DOODLE_DRAW,
+  DOODLE_LIFE,
+  doodleById,
+  doodleForWord,
+  doodlePaths,
+  pose,
+  type Doodle
+} from "./doodles";
 import {
   loadOdometer,
   saveOdometer,
@@ -28,6 +38,8 @@ import {
   savePrefs,
   loadSheet,
   saveSheet,
+  loadUndo,
+  saveUndo,
   type Odometer,
   type Prefs,
   type SavedSheet
@@ -43,6 +55,12 @@ const DRY_MS = 9000;
 const LAND_MS = 110;
 const SEISMO_SPAN = 12000;
 const SAVE_EVERY = 6000;
+/** How long Esc must be held to clear the sheet. A tap does nothing. */
+const ESC_HOLD_MS = 650;
+/** How long a carried word takes to hop down to the next line. */
+const CARRY_MS = 260;
+/** Palette and style changes bloom out from where they were asked for. */
+const BLOOM_MS = 1250;
 
 interface Glyph {
   ch: string;
@@ -55,6 +73,8 @@ interface Glyph {
   stampAt: number | null;
   /** Absolute index of this glyph's event in the session recorder, or -1. */
   echoIdx: number;
+  /** Set when a word wraps: where it was, so it can hop to where it is. */
+  carry: { dx: number; dy: number; at: number } | null;
 }
 
 /** Letterform-shaped shockwave fired by a stamp. */
@@ -75,6 +95,55 @@ interface BakedGlyph {
   w: number;
 }
 
+/** A committed row of the document. */
+interface Line {
+  glyphs: BakedGlyph[];
+  /** Wrapped at the margin: the text continues on the next row, no newline. */
+  soft: boolean;
+  /** Doodles that settled into this row's margin. */
+  marks: string[];
+}
+
+/** A doodle in the air: drawn by the pen, doing its thing, then settling. */
+interface Sprite {
+  d: Doodle;
+  x: number;
+  /** Document row it was written on, so it rides history up on Enter. */
+  row: number;
+  at: number;
+  seed: number;
+}
+
+const SPRITE_CAP = 4;
+/** A margin holds three doodles. */
+const MARKS_PER_ROW = 3;
+/** The same doodle won't answer again for this long. */
+const DOODLE_COOLDOWN = 12000;
+
+/** Colors for the current palette and style, resolved once per change. */
+interface Tones {
+  paper: RGB;
+  ink: RGB;
+  sub: RGB;
+  fresh: RGB;
+  misA: RGB;
+  misB: RGB;
+  /** CSS strings for the colors drawn most often. */
+  inkS: string;
+  subS: string;
+  freshS: string;
+  misAS: string;
+  misBS: string;
+}
+
+/** A palette or style change, revealed as ink spreading from a point. */
+interface Bloom {
+  canvas: HTMLCanvasElement;
+  at: number;
+  x: number;
+  y: number;
+  seed: number;
+}
 interface Dying {
   ch: string;
   x: number;
@@ -153,9 +222,17 @@ export class Engine {
   private typingY = 400;
   private maxCols = 60;
 
-  // Text model
-  private baked: BakedGlyph[][] = [];
+  // Text model. `lines` is the whole document; only the rows that fit on
+  // screen are ever drawn.
+  private lines: Line[] = [];
+  /** Logical line number of each row (0 for a wrapped continuation). */
+  private lineNos: number[] = [];
   private active: Glyph[] = [];
+  /** Doodles in the active row's margin, and when each arrived. */
+  private activeMarks: string[] = [];
+  private activeMarkAt: number[] = [];
+  private sprites: Sprite[] = [];
+  private doodleSeen = new Map<string, number>();
   private caretIdx = 0;
   private dying: Dying[] = [];
   private staticDirty = true;
@@ -168,7 +245,24 @@ export class Engine {
   private captionPunch: Spring;
   private slideFrom = -1e9;
   private wipe: { canvas: HTMLCanvasElement; at: number } | null = null;
+  private bloom: Bloom | null = null;
   private stamps: Stamp[] = [];
+  /** Esc held down: the sheet lifts as you hold, and clears at the top. */
+  private escDownAt: number | null = null;
+  private escLift: Spring;
+  /** A refused keystroke at the margin flashes a silent bell. */
+  private bellAt = -1e9;
+  /** Clicks send a wave through the printed letters. */
+  private waves: { x: number; y: number; at: number }[] = [];
+  /** Character keys physically down right now, for rollover. */
+  private keysDown = new Set<string>();
+  private rollPeak = 0;
+  private rollShownAt = -1e9;
+  /** "lights out": five reds, then go. */
+  private lights: { at: number; outAt: number } | null = null;
+  private lightsWent = false;
+  /** "box box": a pit stop that changes palette. */
+  private pitAt: number | null = null;
 
   // Streaks: consecutive content keys without backspace or a long pause.
   private streak = 0;
@@ -199,6 +293,11 @@ export class Engine {
   private dirtyOdo = false;
   private lastSave = 0;
   private undoSlot: SavedSheet | null = null;
+  private tonesKey = "";
+  private tonesCache: Tones | null = null;
+  private dt = 1 / 60;
+  /** How far the rAF timestamp sits from performance.now(), for the tests. */
+  private rafSkew = 0;
 
   // Overlays and chrome
   private helpOpen = false;
@@ -237,18 +336,31 @@ export class Engine {
     this.squash = new Spring(0, 320, 17);
     this.impact = new Spring(0, 380, 26);
     this.captionPunch = new Spring(0, 300, 16);
+    this.escLift = new Spring(0, 260, 22);
     this.bestAtBoot = this.odo.bestWpm;
 
     this.resize();
     window.addEventListener("resize", () => this.resize());
     window.addEventListener("keydown", (e) => this.onKeyDown(e));
     window.addEventListener("keyup", (e) => this.onKeyUp(e));
+    // Keyups never arrive for keys held while focus leaves (Cmd+Tab, a
+    // click into devtools), so let go of everything when it does.
+    window.addEventListener("blur", () => this.releaseAll(performance.now()));
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "hidden") this.persist(true);
+      if (document.visibilityState === "hidden") {
+        this.releaseAll(performance.now());
+        this.persist(true);
+      }
     });
+    window.addEventListener("pagehide", () => this.persist(true));
+    canvas.addEventListener("pointerdown", (e) => this.onPointer(e));
 
     const saved = loadSheet();
-    if (saved) this.restore(saved);
+    if (saved) {
+      this.restore(saved);
+      this.reflow();
+    }
+    this.undoSlot = loadUndo();
     this.caretX.set(this.colX(this.caretIdx));
 
     document.body.style.background = this.palette().paper;
@@ -266,18 +378,34 @@ export class Engine {
   }
 
   /**
-   * Effective accent colors: elemental styles bring their own fresh-ink
-   * colors. On light paper they are pulled toward the palette ink so pale
-   * accents (Frost) stay legible.
+   * Resolved colors for this palette and style. Elemental styles bring
+   * their own fresh-ink colors; on light paper they are pulled toward the
+   * palette ink so pale accents (Frost) stay legible.
    */
-  private fx(p: Palette, sd: StyleDef): { fresh: string; misA: string; misB: string } {
-    if (!sd.accent) return { fresh: p.fresh, misA: p.misA, misB: p.misB };
-    const adapt = (c: string) => (p.dark ? c : mixHex(c, p.ink, 0.32));
-    return {
-      fresh: adapt(sd.accent.fresh),
-      misA: adapt(sd.accent.misA),
-      misB: adapt(sd.accent.misB)
+  private tones(p: Palette, sd: StyleDef): Tones {
+    const key = `${p.id}/${sd.id}`;
+    if (this.tonesCache && this.tonesKey === key) return this.tonesCache;
+    const ink = rgb(p.ink);
+    const adapt = (hex: string): RGB => (p.dark ? rgb(hex) : mix(rgb(hex), ink, 0.32));
+    const fresh = sd.accent ? adapt(sd.accent.fresh) : rgb(p.fresh);
+    const misA = sd.accent ? adapt(sd.accent.misA) : rgb(p.misA);
+    const misB = sd.accent ? adapt(sd.accent.misB) : rgb(p.misB);
+    const sub = rgb(p.sub);
+    this.tonesCache = {
+      paper: rgb(p.paper),
+      ink,
+      sub,
+      fresh,
+      misA,
+      misB,
+      inkS: css(ink),
+      subS: css(sub),
+      freshS: css(fresh),
+      misAS: css(misA),
+      misBS: css(misB)
     };
+    this.tonesKey = key;
+    return this.tonesCache;
   }
 
   private motionMul(): number {
@@ -305,11 +433,102 @@ export class Engine {
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.font = this.font(460);
     this.advance = this.ctx.measureText("M").width;
-    this.maxCols = Math.max(10, Math.floor((this.w - 2 * this.marginX) / this.advance));
+    const cols = Math.max(10, Math.floor((this.w - 2 * this.marginX) / this.advance));
+    const changed = cols !== this.maxCols;
+    this.maxCols = cols;
+    if (changed) this.reflow();
 
     this.dotPattern = null;
     this.staticDirty = true;
     this.caretX.set(this.colX(this.caretIdx));
+  }
+
+  /**
+   * Rewrap the whole document at the current measure. Rows that wrapped
+   * at the margin rejoin into their logical line and wrap again, so a
+   * narrower window (or a sheet saved on a wider one) never leaves rows
+   * hanging past the margin. Margin doodles stay with their line.
+   */
+  private reflow(): void {
+    const now = performance.now();
+    // The active row and the soft rows before it are one logical line.
+    let tailStart = this.lines.length;
+    while (tailStart > 0 && this.lines[tailStart - 1]!.soft) tailStart--;
+    const tail = this.lines.slice(tailStart);
+    const head = this.lines.slice(0, tailStart);
+
+    const out: Line[] = [];
+    let buf: BakedGlyph[] = [];
+    let marks: string[] = [];
+    for (const l of head) {
+      buf = buf.concat(l.glyphs);
+      marks = marks.concat(l.marks);
+      if (!l.soft) {
+        this.pushWrapped(out, buf, marks, true);
+        buf = [];
+        marks = [];
+      }
+    }
+
+    const back = tail.flatMap((l) => l.glyphs.map((bg) => this.settledGlyph(bg, now)));
+    let active = back.concat(this.active);
+    let caret = back.length + this.caretIdx;
+    let tailMarks = tail.flatMap((l) => l.marks).concat(this.activeMarks);
+    const rows: Glyph[][] = [];
+    while (active.length > this.maxCols) {
+      const k = this.breakAt(active.map((g) => g.ch));
+      rows.push(active.slice(0, k));
+      active = active.slice(k);
+      caret = Math.max(0, caret - k);
+    }
+    rows.forEach((r) => {
+      out.push({
+        glyphs: r.map((g) => ({ ch: g.ch, w: Math.round(recordWeight(g.peak)) })),
+        soft: true,
+        marks: tailMarks.splice(0, MARKS_PER_ROW)
+      });
+    });
+    this.lines = out;
+    this.active = active;
+    this.caretIdx = Math.min(caret, active.length);
+    this.activeMarks = tailMarks.slice(0, MARKS_PER_ROW);
+    this.activeMarkAt = this.activeMarks.map(() => now - 60000);
+    this.sprites = [];
+    this.staticDirty = true;
+  }
+
+  /** Where a row longer than the measure should break: after its last space. */
+  private breakAt(chs: string[]): number {
+    for (let i = Math.min(this.maxCols, chs.length - 1); i > 0; i--) {
+      if (chs[i] === " ") return i + 1;
+    }
+    return this.maxCols;
+  }
+
+  private pushWrapped(out: Line[], gs: BakedGlyph[], marks: string[], hard: boolean): void {
+    const ms = marks.slice();
+    let rest = gs;
+    do {
+      const k = rest.length > this.maxCols ? this.breakAt(rest.map((g) => g.ch)) : rest.length;
+      const row = rest.slice(0, k);
+      rest = rest.slice(k);
+      out.push({ glyphs: row, soft: rest.length > 0 || !hard, marks: ms.splice(0, MARKS_PER_ROW) });
+    } while (rest.length > 0);
+  }
+
+  /** A committed glyph brought back to the active row, already dry. */
+  private settledGlyph(bg: BakedGlyph, now: number): Glyph {
+    return {
+      ch: bg.ch,
+      born: now - 60000,
+      upAt: now - 60000,
+      code: "",
+      cap: false,
+      peak: peakFromRecord(bg.w),
+      stampAt: null,
+      echoIdx: -1,
+      carry: null
+    };
   }
 
   private font(weight: number, px = this.fs): string {
@@ -332,6 +551,7 @@ export class Engine {
       this.odo.perKey[e.code] = (this.odo.perKey[e.code] ?? 0) + 1;
       this.sessionKeys += 1;
       this.dirtyOdo = true;
+      if (key.length === 1 && !e.ctrlKey && !e.metaKey) this.noteRoll(e.code, now);
     }
     if (key === "Shift") this.shiftHeld = true;
 
@@ -372,8 +592,11 @@ export class Engine {
 
     switch (key) {
       case "Escape":
+        // Clearing is deliberate: hold Esc and the sheet lifts away. A tap,
+        // the reflex of every vim hand, does nothing to the writing.
         e.preventDefault();
-        this.clearSheet();
+        if (e.repeat) return;
+        if (this.lines.length || this.active.length) this.escDownAt = now;
         return;
       case "Backspace":
         e.preventDefault();
@@ -392,8 +615,9 @@ export class Engine {
         return;
       case "Tab":
         e.preventDefault();
-        this.insertChar(" ", "Space", now);
-        this.insertChar(" ", "Space", now);
+        if (e.repeat) return;
+        this.insertChar(" ", "Tab", now);
+        this.insertChar(" ", "Tab", now);
         return;
       case "ArrowLeft":
         e.preventDefault();
@@ -430,8 +654,19 @@ export class Engine {
 
   private onKeyUp(e: KeyboardEvent): void {
     const now = performance.now();
+    this.keysDown.delete(e.code);
+    if (this.keysDown.size === 0) this.rollPeak = 0;
     if (e.key === "Shift") this.shiftHeld = false;
     if (e.key === "Backspace") this.bsHeld = false;
+    if (e.key === "Escape" && this.escDownAt !== null) {
+      const held = now - this.escDownAt;
+      this.escDownAt = null;
+      // A long enough hold counts even if no frame landed to see it through.
+      if (held >= ESC_HOLD_MS) {
+        this.clearSheet();
+        this.escLift.set(0);
+      } else if (held < 220) this.toast("hold Esc to clear the sheet");
+    }
     for (let i = 0; i < this.active.length; i++) {
       const g = this.active[i]!;
       if (g.code === e.code && g.upAt === null) {
@@ -460,6 +695,79 @@ export class Engine {
     }
   }
 
+  /**
+   * Let go of every held key at once. Held letters settle at whatever
+   * weight they reached (no stamp: nobody released them on purpose).
+   */
+  private releaseAll(now: number): void {
+    this.keysDown.clear();
+    this.rollPeak = 0;
+    this.bsHeld = false;
+    this.shiftHeld = false;
+    this.escDownAt = null;
+    for (const g of this.active) {
+      if (g.upAt !== null) continue;
+      this.glyphWeight(g, now);
+      g.upAt = now;
+      if (g.echoIdx >= 0) this.recorder.setWeight(g.echoIdx, Math.round(recordWeight(g.peak)));
+    }
+  }
+
+  /**
+   * Rollover. Fast hands hold several keys at once as they roll through a
+   * word; three or more at once gets a sticker, and the odometer keeps
+   * your biggest roll. NKRO keyboards finally get to show off.
+   */
+  private noteRoll(code: string, now: number): void {
+    this.keysDown.add(code);
+    const n = this.keysDown.size;
+    if (n <= this.rollPeak) return;
+    this.rollPeak = n;
+    if (n > this.odo.bestRoll) {
+      this.odo.bestRoll = n;
+      this.dirtyOdo = true;
+    }
+    if (n >= 3 && (n >= 4 || now - this.rollShownAt > 8000)) {
+      this.rollShownAt = now;
+      this.captionOverride = { text: `${n}-KEY ROLL`, until: now + 1100 };
+      this.captionPunch.kick(4);
+    }
+  }
+
+  /** A click or tap sends a wave out through the printed letters. */
+  private onPointer(e: PointerEvent): void {
+    if (this.helpOpen || this.statsOpen) {
+      this.helpOpen = false;
+      this.statsOpen = false;
+      return;
+    }
+    if (this.motionMul() === 0) return;
+    this.waves.push({ x: e.clientX, y: e.clientY, at: performance.now() });
+    if (this.waves.length > 3) this.waves.shift();
+  }
+
+  /**
+   * How far the click waves push a point right now: a ring travelling
+   * outward from each click, shoving letters away from it as it passes.
+   */
+  private waveAt(x: number, y: number, now: number): [number, number] {
+    let ox = 0;
+    let oy = 0;
+    for (const w of this.waves) {
+      const t = (now - w.at) / 1600;
+      if (t >= 1) continue;
+      const dx = x - w.x;
+      const dy = y - w.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const front = (now - w.at) * 0.95;
+      const u = (d - front) / 46;
+      const m = Math.exp(-u * u) * Math.sin(u * 2.2) * 10 * (1 - t) * (1 - t) * this.motionMul();
+      ox += (dx / d) * m;
+      oy += (dy / d) * m;
+    }
+    return [ox, oy];
+  }
+
   private handleFn(n: number): void {
     switch (n) {
       case 1:
@@ -474,6 +782,7 @@ export class Engine {
         break;
       case 4: {
         const idx = STYLES.findIndex((s) => s.id === this.prefs.style);
+        this.startBloom(this.caretX.x, this.typingY - this.fs * 0.35);
         this.prefs.style = STYLES[(idx + 1) % STYLES.length]!.id;
         this.toast(`Style: ${this.style().label}`);
         this.dotPattern = null;
@@ -488,6 +797,7 @@ export class Engine {
         break;
       case 6:
         this.prefs.caption = !this.prefs.caption;
+        this.staticDirty = true;
         this.toast(`Flow caption ${this.prefs.caption ? "on" : "off"}`);
         savePrefs(this.prefs);
         break;
@@ -504,6 +814,7 @@ export class Engine {
         break;
       case 9:
         this.prefs.chrome = !this.prefs.chrome;
+        this.staticDirty = true;
         this.toast(`Controls strip ${this.prefs.chrome ? "shown" : "hidden"}`);
         savePrefs(this.prefs);
         break;
@@ -514,19 +825,60 @@ export class Engine {
 
   private cyclePalette(dir: number): void {
     const n = PALETTES.length;
-    this.prefs.palette = (this.prefs.palette + dir + n) % n;
+    this.startBloom(this.caretX.x, this.typingY - this.fs * 0.35);
+    this.setPalette((this.prefs.palette + dir + n) % n);
+    this.toast(`Palette: ${this.palette().label}`);
+  }
+
+  private setPalette(idx: number): void {
+    this.prefs.palette = idx;
     document.body.style.background = this.palette().paper;
     this.dotPattern = null;
     this.staticDirty = true;
-    this.toast(`Palette: ${this.palette().label}`);
     savePrefs(this.prefs);
+  }
+
+  /**
+   * Freeze the current frame so the next one can be revealed through it:
+   * the new palette or style spreads out from (x, y) like a drop of ink
+   * on damp paper, with a darker tide line at its edge.
+   */
+  private startBloom(x: number, y: number): void {
+    const prev = this.bloom?.canvas;
+    const snap = prev && prev.width === this.canvas.width && prev.height === this.canvas.height
+      ? prev
+      : document.createElement("canvas");
+    snap.width = this.canvas.width;
+    snap.height = this.canvas.height;
+    const sc = snap.getContext("2d");
+    if (!sc) return;
+    sc.drawImage(this.canvas, 0, 0);
+    this.bloom = { canvas: snap, at: performance.now(), x, y, seed: Math.random() * 1000 };
   }
 
   // ------------------------------------------------------------- edits
 
   private insertChar(ch: string, code: string, now: number): void {
-    if (ch === " ") this.checkSecretWord(now);
-    if (this.active.length >= this.maxCols) this.commitLine(now);
+    // The margin. Mid-line there is nowhere for the overflow to go, so the
+    // bell rings (silently) and the key is refused, like a carriage at its
+    // stop. At the end of the line the text wraps, carrying any unfinished
+    // word down with it.
+    const full = this.active.length >= this.maxCols;
+    if (full && this.caretIdx < this.active.length) {
+      this.bellAt = now;
+      this.squash.kick(-1.6 * this.motionMul());
+      return;
+    }
+    if (ch === " ") this.checkDoodle(now);
+    if (full) {
+      this.wrapLine(ch, now);
+      if (ch === " ") {
+        this.hasTyped = true;
+        this.lastInput = now;
+        this.bumpStreak(now);
+        return;
+      }
+    }
     const g: Glyph = {
       ch,
       born: now,
@@ -535,7 +887,8 @@ export class Engine {
       cap: ch >= "A" && ch <= "Z",
       peak: BASE_W,
       stampAt: null,
-      echoIdx: this.recorder.note(ch, now)
+      echoIdx: this.recorder.note(ch, now),
+      carry: null
     };
     this.active.splice(this.caretIdx, 0, g);
     this.caretIdx += 1;
@@ -556,6 +909,49 @@ export class Engine {
     }
     this.spawnFor(this.colX(this.caretIdx - 1), this.typingY - this.fs * 0.35, now, 1);
     this.dirtySheet = true;
+  }
+
+  /**
+   * Soft wrap at the margin. A space typed at the margin ends the row (and
+   * stays on it, invisible, so copied text keeps it). Otherwise the word in
+   * progress hops down to the new row; a single word wider than the whole
+   * measure has nowhere to hop and breaks where it is.
+   */
+  private wrapLine(ch: string, now: number): void {
+    let keep = this.active.length;
+    if (ch !== " ") {
+      const sp = this.active.map((g) => g.ch).lastIndexOf(" ");
+      if (sp >= 0) keep = sp + 1;
+    }
+    const carried = this.active.slice(keep);
+    this.active = this.active.slice(0, keep);
+    if (ch === " ") {
+      this.active.push({
+        ch,
+        born: now,
+        upAt: now,
+        code: "",
+        cap: false,
+        peak: BASE_W,
+        stampAt: null,
+        echoIdx: this.recorder.note(ch, now),
+        carry: null
+      });
+      this.rhythm.record(now);
+    }
+    this.bakeActive(true, now);
+    const mm = this.motionMul();
+    carried.forEach((g, j) => {
+      g.carry = mm > 0 ? { dx: keep * this.advance, dy: 0, at: now + j * 14 } : null;
+    });
+    this.active = carried;
+    this.caretIdx = carried.length;
+    this.caretX.set(this.colX(carried.length));
+    // The carriage returns: the caret sweeps back from the margin.
+    if (mm > 0) {
+      this.caretX.x = this.colX(this.maxCols);
+      this.caretX.v = -2400 * mm;
+    }
   }
 
   /** Streak bookkeeping plus milestone celebrations. */
@@ -592,50 +988,110 @@ export class Engine {
       this.impact.kick(-14 * this.motionMul());
       this.lastInput = now;
       this.dirtySheet = true;
-    } else if (this.baked.length > 0) {
+    } else if (this.lines.length > 0) {
       this.unEnter(now);
     } else {
       this.squash.kick(-1.2 * this.motionMul());
     }
   }
 
-  private commitLine(now: number): void {
-    this.checkSecretWord(now);
-    this.recorder.note("\n", now);
-    const line: BakedGlyph[] = this.active.map((g) => ({
-      ch: g.ch,
-      w: Math.round(recordWeight(g.peak))
-    }));
-    this.baked.push(line);
-    const keep = Math.ceil(this.typingY / this.lineHeight) + 4;
-    if (this.baked.length > keep) this.baked.splice(0, this.baked.length - keep);
+  /** Move the active row into the document and start a fresh one. */
+  private bakeActive(soft: boolean, now: number): void {
+    this.lines.push({
+      glyphs: this.active.map((g) => ({ ch: g.ch, w: Math.round(recordWeight(g.peak)) })),
+      soft,
+      marks: this.activeMarks
+    });
+    this.activeMarks = [];
+    this.activeMarkAt = [];
     this.active = [];
     this.caretIdx = 0;
     this.slideFrom = now;
     this.staticDirty = true;
+    this.dirtySheet = true;
+  }
+
+  private commitLine(now: number): void {
+    if (this.secretLine(now)) return;
+    this.checkDoodle(now);
+    this.recorder.note("\n", now);
+    this.bakeActive(false, now);
     this.squash.kick(4.2 * this.motionMul());
     this.impact.kick(85 * this.motionMul());
     this.bumpStreak(now);
     this.spawnFor(this.caretX.x, this.typingY - this.fs * 0.35, now, 2);
-    this.dirtySheet = true;
   }
 
   /**
-   * The page listens for words. Typing a style's name (or its element:
-   * fire, water, ice, wind) switches to it mid-sentence; palettes answer
-   * to their names; "zen" hides all chrome. Checked at word boundaries
-   * (space or Enter), reading the letters just behind the caret.
+   * Some words draw themselves. Reads the word just behind the caret (any
+   * trailing punctuation skipped) and, if it has a doodle, sends one up.
    */
-  private checkSecretWord(now: number): void {
+  private checkDoodle(now: number): void {
+    let i = this.caretIdx - 1;
+    while (i >= 0 && /[.,!?;:'")\]]/.test(this.active[i]!.ch)) i--;
+    const end = i + 1;
     let word = "";
-    for (let i = this.caretIdx - 1; i >= 0 && word.length < 12; i--) {
+    for (; i >= 0 && word.length < 16; i--) {
       const c = this.active[i]!.ch;
-      if (!/[a-zA-Z]/.test(c)) break;
+      if (!/[a-zA-Z0-9]/.test(c)) break;
       word = c.toLowerCase() + word;
     }
-    if (word.length < 3) return;
+    if (word.length < 2) return;
+    const d = doodleForWord(word);
+    if (!d) return;
+    const last = this.doodleSeen.get(d.id) ?? -1e9;
+    if (now - last < DOODLE_COOLDOWN) return;
+    this.doodleSeen.set(d.id, now);
+    const start = end - word.length;
+    this.sprites.push({
+      d,
+      x: this.colX(start) + (word.length * this.advance) / 2,
+      row: this.lines.length,
+      at: now,
+      seed: Math.random()
+    });
+    if (this.sprites.length > SPRITE_CAP) this.sprites.shift();
+    if (!this.activeMarks.includes(d.id)) {
+      if (this.activeMarks.length >= MARKS_PER_ROW) {
+        this.activeMarks.shift();
+        this.activeMarkAt.shift();
+      }
+      this.activeMarks.push(d.id);
+      this.activeMarkAt.push(now + DOODLE_LIFE - 500);
+      this.dirtySheet = true;
+    }
+    if (!this.odo.found.includes(d.id)) {
+      this.odo.found.push(d.id);
+      this.dirtyOdo = true;
+      this.toast(`found a doodle: ${d.id} · ${this.odo.found.length} of ${DOODLES.length}`);
+    }
+  }
 
-    const styleAlias: Record<string, string> = {
+  /**
+   * The page listens for words, but only when you clearly mean it: a
+   * style's name (or its element: fire, water, ice, wind), a palette's
+   * name, or "zen", written alone on its line and sent with Enter. Prose
+   * that merely mentions water stays prose. The word is spent: it stamps
+   * itself into the page and the change blooms out from where it stood.
+   */
+  private secretLine(now: number): boolean {
+    // A word that merely wrapped onto its own row is still prose.
+    if (this.lines[this.lines.length - 1]?.soft) return false;
+    const word = this.active.map((g) => g.ch).join("").trim().toLowerCase().replace(/\s+/g, " ");
+    if (word === "lights out" || word === "box box") {
+      this.spendLine();
+      if (word === "lights out") {
+        this.lights = { at: now, outAt: now + 4000 + 200 + Math.random() * 2800 };
+        this.lightsWent = false;
+      } else {
+        this.pitAt = now;
+        this.toast("box box");
+      }
+      return true;
+    }
+    if (word.length < 3 || word.length > 12 || !/^[a-z]+$/.test(word)) return false;
+
+    const styleAlias: Record<string, Prefs["style"]> = {
       fire: "ember",
       ember: "ember",
       water: "tide",
@@ -649,53 +1105,80 @@ export class Engine {
       plain: "clean",
       clean: "clean"
     };
-
     const styleId = styleAlias[word];
-    if (styleId && styleId !== this.prefs.style) {
-      this.prefs.style = styleId as Prefs["style"];
-      this.dotPattern = null;
-      this.staticDirty = true;
-      this.toast(`You typed it. Style: ${this.style().label}`);
-      this.impact.kick(60 * this.motionMul());
-      savePrefs(this.prefs);
-      return;
-    }
-
     const palIdx = PALETTES.findIndex((p) => p.id === word);
-    if (palIdx >= 0 && palIdx !== this.prefs.palette) {
-      this.prefs.palette = palIdx;
-      document.body.style.background = this.palette().paper;
+    if (!styleId && palIdx < 0 && word !== "zen") return false;
+
+    // Where the word sits on the line: the bloom starts at its middle.
+    let first = this.active.findIndex((g) => g.ch !== " ");
+    if (first < 0) first = 0;
+    const mid = this.colX(first) + (word.length * this.advance) / 2;
+    const cy = this.typingY - this.fs * 0.35;
+    this.startBloom(mid, cy);
+    if (this.motionMul() > 0) {
+      for (let i = 0; i < this.active.length; i++) {
+        const g = this.active[i]!;
+        if (g.ch === " ") continue;
+        this.stamps.push({ ch: g.ch, x: this.colX(i), w: this.glyphWeight(g, now) + 120, at: now + i * 28, power: 1 });
+      }
+      if (this.stamps.length > 24) this.stamps.splice(0, this.stamps.length - 24);
+    }
+    this.spendLine();
+    this.impact.kick(70 * this.motionMul());
+    this.squash.kick(4 * this.motionMul());
+
+    if (styleId) {
+      this.prefs.style = styleId;
       this.dotPattern = null;
       this.staticDirty = true;
-      this.toast(`You typed it. Palette: ${this.palette().label}`);
+      this.toast(`you typed it. style: ${this.style().label.toLowerCase()}`);
       savePrefs(this.prefs);
-      return;
-    }
-
-    if (word === "zen") {
+    } else if (palIdx >= 0) {
+      this.setPalette(palIdx);
+      this.toast(`you typed it. palette: ${this.palette().label.toLowerCase()}`);
+    } else {
       const anyOn = this.prefs.chrome || this.prefs.seismo || this.prefs.caption;
       this.prefs.chrome = !anyOn;
       this.prefs.seismo = !anyOn;
       this.prefs.caption = !anyOn;
+      this.staticDirty = true;
       this.toast(anyOn ? "zen" : "welcome back");
       savePrefs(this.prefs);
     }
-    void now;
+    return true;
   }
 
+  /** A command line is spent: its words, and any doodles they drew, go. */
+  private spendLine(): void {
+    const row = this.lines.length;
+    this.active = [];
+    this.caretIdx = 0;
+    this.activeMarks = [];
+    this.activeMarkAt = [];
+    this.sprites = this.sprites.filter((sp) => sp.row !== row);
+    this.dirtySheet = true;
+  }
+
+  /**
+   * Backspace at the start of a row pulls the row above back down. If the
+   * two would not fit on one row together, the bell rings instead.
+   */
   private unEnter(now: number): void {
-    const line = this.baked.pop()!;
-    this.active = line.map((bg) => ({
-      ch: bg.ch,
-      born: now - 60000,
-      upAt: now - 60000,
-      code: "",
-      cap: false,
-      peak: peakFromRecord(bg.w),
-      stampAt: null,
-      echoIdx: -1
-    }));
-    this.caretIdx = this.active.length;
+    const prev = this.lines[this.lines.length - 1]!;
+    if (
+      (this.active.length > 0 && prev.glyphs.length + this.active.length > this.maxCols) ||
+      prev.marks.length + this.activeMarks.length > MARKS_PER_ROW
+    ) {
+      this.bellAt = now;
+      this.squash.kick(-1.6 * this.motionMul());
+      return;
+    }
+    this.lines.pop();
+    this.activeMarks = prev.marks.concat(this.activeMarks);
+    this.activeMarkAt = this.activeMarks.map(() => now - 60000);
+    const back = prev.glyphs.map((bg) => this.settledGlyph(bg, now));
+    this.active = back.concat(this.active);
+    this.caretIdx = back.length;
     this.caretX.set(this.colX(this.caretIdx));
     this.staticDirty = true;
     this.lastInput = now;
@@ -703,8 +1186,9 @@ export class Engine {
   }
 
   private clearSheet(): void {
-    if (this.baked.length === 0 && this.active.length === 0) return;
+    if (this.lines.length === 0 && this.active.length === 0) return;
     this.undoSlot = this.serialize();
+    saveUndo(this.undoSlot);
 
     const snap = document.createElement("canvas");
     snap.width = this.canvas.width;
@@ -713,60 +1197,126 @@ export class Engine {
     if (sc) sc.drawImage(this.canvas, 0, 0);
     this.wipe = { canvas: snap, at: performance.now() };
 
-    this.baked = [];
+    this.lines = [];
     this.active = [];
+    this.activeMarks = [];
+    this.activeMarkAt = [];
+    this.sprites = [];
     this.caretIdx = 0;
     this.staticDirty = true;
     this.dirtySheet = true;
-    this.toast("Cleared. Ctrl+Z restores");
+    this.persist(true);
+    this.toast("cleared. Ctrl+Z brings it back");
   }
 
+  /**
+   * Bring back the last cleared sheet. Whatever is on the page now trades
+   * places with it, so a second Ctrl+Z undoes the undo and nothing is ever
+   * lost to it.
+   */
   private undoClear(): void {
     if (!this.undoSlot) return;
+    const current = this.lines.length || this.active.length ? this.serialize() : null;
     this.restore(this.undoSlot);
-    this.undoSlot = null;
+    this.undoSlot = current;
+    saveUndo(current);
+    this.caretX.set(this.colX(this.caretIdx));
     this.staticDirty = true;
     this.dirtySheet = true;
-    this.toast("Restored");
+    this.persist(true);
+    this.toast("restored");
+  }
+
+  /** The whole document as plain text. Wrapped rows rejoin. */
+  private text(): string {
+    let out = "";
+    for (const l of this.lines) {
+      for (const g of l.glyphs) out += g.ch;
+      if (!l.soft) out += "\n";
+    }
+    for (const g of this.active) out += g.ch;
+    return out;
   }
 
   private copyAll(): void {
-    const text =
-      this.baked.map((l) => l.map((g) => g.ch).join("")).join("\n") +
-      (this.baked.length ? "\n" : "") +
-      this.active.map((g) => g.ch).join("");
+    const text = this.text();
     if (!text.trim()) return;
     navigator.clipboard
       .writeText(text)
-      .then(() => this.toast("Copied to clipboard"))
-      .catch(() => this.toast("Copy failed"));
+      .then(() => this.toast("copied, all of it"))
+      .catch(() => this.toast("copy failed"));
   }
 
   private serialize(): SavedSheet {
     const now = performance.now();
     return {
-      lines: this.baked.map((l) => l.map((g) => ({ ch: g.ch, w: g.w }))),
+      lines: this.lines.map((l) => ({
+        glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })),
+        soft: l.soft,
+        marks: l.marks.slice()
+      })),
       active: this.active.map((g) => ({
         ch: g.ch,
         w: Math.round(recordWeight(g.upAt === null ? this.glyphWeight(g, now) : g.peak))
-      }))
+      })),
+      activeMarks: this.activeMarks.slice()
     };
   }
 
   private restore(s: SavedSheet): void {
     const now = performance.now();
-    this.baked = s.lines.map((l) => l.map((g) => ({ ch: g.ch, w: g.w })));
-    this.active = s.active.map((g) => ({
-      ch: g.ch,
-      born: now - 60000,
-      upAt: now - 60000,
-      code: "",
-      cap: false,
-      peak: peakFromRecord(g.w),
-      stampAt: null,
-      echoIdx: -1
+    const known = (ms: string[]) => ms.filter((m) => doodleById(m)).slice(0, MARKS_PER_ROW);
+    this.lines = s.lines.map((l) => ({
+      glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })),
+      soft: l.soft,
+      marks: known(l.marks)
     }));
+    this.activeMarks = known(s.activeMarks);
+    this.activeMarkAt = this.activeMarks.map(() => now - 60000);
+    this.sprites = [];
+    this.active = s.active.map((g) => this.settledGlyph(g, now));
     this.caretIdx = this.active.length;
+  }
+
+  /** Read-only state for the end-to-end tests (enabled with ?probe). */
+  probe(): {
+    text: string;
+    rows: string[];
+    marks: string[][];
+    activeMarks: string[];
+    found: string[];
+    bestRoll: number;
+    active: string;
+    activeLineNo: number;
+    lineNos: number[];
+    prefs: Prefs;
+    layout: { marginX: number; typingY: number; advance: number; fs: number; lineHeight: number; maxCols: number };
+    canUndo: boolean;
+    rafSkew: number;
+  } {
+    if (this.staticDirty) this.renumber();
+    return {
+      text: this.text(),
+      rows: this.lines.map((l) => l.glyphs.map((g) => g.ch).join("")),
+      marks: this.lines.map((l) => l.marks.slice()),
+      activeMarks: this.activeMarks.slice(),
+      found: this.odo.found.slice(),
+      bestRoll: this.odo.bestRoll,
+      active: this.active.map((g) => g.ch).join(""),
+      activeLineNo: this.activeLineNo(),
+      lineNos: this.lineNos.slice(),
+      prefs: { ...this.prefs },
+      layout: {
+        marginX: this.marginX,
+        typingY: this.typingY,
+        advance: this.advance,
+        fs: this.fs,
+        lineHeight: this.lineHeight,
+        maxCols: this.maxCols
+      },
+      canUndo: this.undoSlot !== null,
+      rafSkew: this.rafSkew
+    };
   }
 
   private persist(force: boolean): void {
@@ -792,28 +1342,82 @@ export class Engine {
 
   private exportPrint(): void {
     if (this.recorder.length < 8) {
-      this.toast("Type a little first, then Ctrl+S");
+      this.toast("type a little first, then Ctrl+S");
       return;
     }
     const p = this.palette();
-    const ok = downloadRhythmPrint(
-      this.recorder.toEcho(),
-      { paper: p.paper, ink: p.ink, fresh: p.fresh, sub: p.sub, misA: p.misA, misB: p.misB },
-      {
-        total: this.odo.total,
-        bestWpm: this.odo.bestWpm,
-        styleLabel: this.style().label,
-        paletteLabel: p.label
+    const sheet = this.serialize();
+    const glyphs = sheet.lines.flatMap((l) => (l.soft ? l.glyphs : [...l.glyphs, { ch: "\n", w: 400 }]));
+    glyphs.push(...sheet.active);
+    const marks = sheet.lines.flatMap((l) => l.marks).concat(sheet.activeMarks);
+    const canvas = downloadRhythmPrint({
+      echo: this.recorder.toEcho(),
+      glyphs,
+      marks,
+      pal: { paper: p.paper, ink: p.ink, fresh: p.fresh, sub: p.sub, misA: p.misA, misB: p.misB, dark: p.dark },
+      stats: { keys: this.recorder.length, styleLabel: this.style().label, paletteLabel: p.label }
+    });
+    if (canvas) {
+      this.proof = { canvas, at: performance.now() };
+      this.impact.kick(60 * this.motionMul());
+    }
+    this.toast(canvas ? "proof pulled. it's in your downloads" : "nothing to print yet");
+  }
+
+  /** The proof slides out over the page like a sheet off the press. */
+  private proof: { canvas: HTMLCanvasElement; at: number } | null = null;
+
+  private drawProof(p: Palette, now: number, mm: number): void {
+    const pr = this.proof!;
+    const t = now - pr.at;
+    const LIFE = 3000;
+    if (t > LIFE) {
+      this.proof = null;
+      return;
+    }
+    const ctx = this.ctx;
+    const sh = Math.min(this.h * 0.8, (this.w * 0.86) / 0.75);
+    const sw = sh * 0.75;
+    const x = (this.w - sw) / 2;
+    const rest = (this.h - sh) / 2;
+    let y = rest;
+    let a = 1;
+    if (mm > 0) {
+      const enter = clamp(t / 650, 0, 1);
+      const spring = 1 - Math.exp(-6 * enter) * Math.cos(7 * enter);
+      y = -sh + (rest + sh) * spring;
+      if (t > 2300) {
+        const out = easeOut((t - 2300) / 700);
+        y = rest + out * this.h * 0.9;
+        a = 1 - out;
       }
-    );
-    this.toast(ok ? "Rhythm print saved" : "Nothing to print yet");
+    } else {
+      a = t < 300 ? t / 300 : t > 2600 ? 1 - (t - 2600) / 400 : 1;
+    }
+    ctx.globalAlpha = 0.55 * Math.min(1, t / 250) * (t > 2300 ? 1 - clamp((t - 2300) / 700, 0, 1) : 1);
+    ctx.fillStyle = p.paper;
+    ctx.fillRect(0, 0, this.w, this.h);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.fillRect(x + 8, y + 12, sw, sh);
+    ctx.drawImage(pr.canvas, x, y, sw, sh);
+    ctx.globalAlpha = 1;
   }
 
   // ------------------------------------------------------------ frame
 
-  private frame(t: number): void {
+  private frame(rafT: number): void {
+    // Ask for the next frame first: if anything in this one throws, the
+    // page keeps living instead of freezing on the last good frame.
+    requestAnimationFrame((nt) => this.frame(nt));
+    // One clock for everything. Keystrokes are stamped with
+    // performance.now(), so frames are too; the rAF timestamp is not
+    // guaranteed to sit on the same timeline in every engine.
+    const t = performance.now();
+    this.rafSkew = rafT - t;
     const dt = clamp((t - this.prev) / 1000, 0, 0.04);
     this.prev = t;
+    this.dt = dt;
 
     // Signals
     const flow = this.rhythm.flow(t);
@@ -842,6 +1446,36 @@ export class Engine {
       }
     }
 
+    if (this.lights && t >= this.lights.outAt && !this.lightsWent) {
+      this.lightsWent = true;
+      this.celebrate("AWAY WE GO", t);
+      this.toast("lights out and away we go");
+      const car = doodleById("car");
+      if (car) {
+        this.sprites.push({ d: car, x: this.caretX.x, row: this.lines.length, at: t - DOODLE_DRAW, seed: 0.5 });
+      }
+    }
+    if (this.pitAt !== null && t - this.pitAt >= 2300) {
+      this.pitAt = null;
+      this.cyclePalette(1);
+      this.toast(`pit stop: 2.3s. new tyres: ${this.palette().label.toLowerCase()}`);
+    }
+
+    // Esc held long enough: the lifted sheet lets go.
+    let escT = 0;
+    if (this.escDownAt !== null) {
+      escT = (t - this.escDownAt) / ESC_HOLD_MS;
+      if (escT >= 1) {
+        this.escDownAt = null;
+        escT = 0;
+        this.clearSheet();
+        this.escLift.set(0);
+      }
+    }
+    this.escLift.target = escT;
+    if (escT > 0) this.escLift.set(escT);
+    else this.escLift.update(dt);
+
     this.caretX.target = this.colX(this.caretIdx);
     this.caretX.update(dt);
     this.squash.target = 0;
@@ -853,7 +1487,6 @@ export class Engine {
 
     this.persist(false);
     this.draw(t);
-    requestAnimationFrame((nt) => this.frame(nt));
   }
 
   // ------------------------------------------------------------- draw
@@ -875,11 +1508,17 @@ export class Engine {
   private draw(now: number): void {
     const p = this.palette();
     const sd = this.style();
-    const fx = this.fx(p, sd);
+    const fx = this.tones(p, sd);
     const ctx = this.ctx;
     const mm = this.motionMul();
 
+    // Every frame starts from a known canvas state. Nothing drawn last
+    // frame (a stray shadow, a dangling alpha) can leak into this one.
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.shadowBlur = 0;
+    ctx.shadowColor = "rgba(0,0,0,0)";
     ctx.fillStyle = p.paper;
     ctx.fillRect(0, 0, this.w, this.h);
 
@@ -891,51 +1530,148 @@ export class Engine {
 
     // The writing surface: a faint full-height ruled sheet the text sits on,
     // brightest at the active line. Drawn under all ink.
-    this.drawRules(p, fx, now, mm);
+    this.drawRules(fx, now, mm);
+
+    // Holding Esc lifts the writing off the page: it rises and thins out
+    // as the hold goes on, and drops back if you let go early.
+    const lift = clamp(this.escLift.x, -0.2, 1);
+    const liftY = -lift * this.lineHeight * 0.35 * Math.max(mm, 0.3);
+    this.inkAlpha = 1 - clamp(lift, 0, 1) * 0.72;
 
     // Settled history (static layer), with the Enter slide.
-    if (this.staticDirty) this.rebuildStatic(p, now);
+    if (this.staticDirty) this.rebuildStatic(p, fx);
     const slideT = clamp((now - this.slideFrom) / 170, 0, 1);
     const slide = (1 - easeOut(slideT)) * this.lineHeight * mm;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.drawImage(this.staticCanvas, 0, (slide + pageY) * this.dpr);
+    ctx.globalAlpha = this.inkAlpha;
+    this.waves = this.waves.filter((w) => now - w.at < 1600);
+    if (this.waves.length === 0) {
+      ctx.drawImage(this.staticCanvas, 0, (slide + pageY + liftY) * this.dpr);
+    } else {
+      // While a wave is passing, history is drawn in small tiles, each
+      // pushed by the wave where it sits. Only the rows that hold ink.
+      // Only tiles the wave front is passing through move; every run of
+      // still tiles in a row is drawn as one span.
+      const T = 18;
+      const d = this.dpr;
+      const top = Math.max(0, Math.floor(this.historyFade().clearTop / T) * T);
+      const bottom = this.typingY;
+      const off = slide + pageY + liftY;
+      const reach = 46 * 2.6 + T;
+      const fronts = this.waves.map((w) => ({ x: w.x, y: w.y, r: Math.max(0, now - w.at) * 0.95 }));
+      const span = (x0: number, x1: number, ty: number) => {
+        if (x1 > x0) ctx.drawImage(this.staticCanvas, x0 * d, ty * d, (x1 - x0) * d, T * d, x0 * d, (ty + off) * d, (x1 - x0) * d, T * d);
+      };
+      for (let ty = top; ty < bottom; ty += T) {
+        let still = 0;
+        for (let tx = 0; tx < this.w; tx += T) {
+          const cx = tx + T / 2;
+          const cy = ty + off + T / 2;
+          const near = fronts.some((f) => Math.abs(Math.hypot(cx - f.x, cy - f.y) - f.r) < reach);
+          if (!near) continue;
+          span(still, tx, ty);
+          still = tx + T;
+          const [wx, wy] = this.waveAt(cx, cy, now);
+          ctx.drawImage(this.staticCanvas, tx * d, ty * d, T * d, T * d, (tx + wx) * d, (ty + off + wy) * d, T * d, T * d);
+        }
+        span(still, this.w, ty);
+      }
+    }
     ctx.restore();
+    if (this.waves.length) this.drawWaveFronts(fx, now);
 
     this.drawRipples(fx, now, mm);
     this.drawParticles(fx, now);
-    this.drawActiveLine(p, sd, fx, now, mm);
+    ctx.translate(0, liftY);
+    this.drawActiveLine(sd, fx, now, mm);
+    ctx.translate(0, -liftY);
+    this.inkAlpha = 1;
     this.drawStamps(fx, now, mm);
-    this.drawDying(p, now);
-    this.drawCaret(p, sd, fx, now, mm);
+    this.drawSprites(p, fx, now, mm, slide);
+    this.drawActiveMarks(fx, now);
+    this.drawDying(fx, now);
+    this.drawCaret(sd, fx, now, mm);
+    if (lift > 0.001) this.drawEscHold(fx, lift);
+    this.drawBell(fx, now, mm);
     if (this.prefs.seismo) this.drawSeismo(p, fx, now);
     this.drawCaption(p, sd, fx, now);
     if (this.prefs.chrome) this.drawChrome(p, sd, now);
     this.drawWelcome(p, now);
     this.drawToast(p, now);
 
+    if (this.lights) this.drawLights(now, mm);
+    if (this.bloom) this.drawBloom(fx, now, mm);
     if (this.wipe) this.drawWipe(now, mm);
+    if (this.proof) this.drawProof(p, now, mm);
     if (this.helpOpen) this.drawHelp(p, sd);
-    if (this.statsOpen) this.drawStats(p);
+    if (this.statsOpen) this.drawStats(p, fx);
   }
 
-  private rebuildStatic(p: Palette, now: number): void {
+  /** Recompute logical line numbers (wrapped rows continue a number). */
+  private renumber(): void {
+    const nos = new Array<number>(this.lines.length);
+    let n = 0;
+    let continuing = false;
+    for (let i = 0; i < this.lines.length; i++) {
+      nos[i] = continuing ? 0 : ++n;
+      continuing = this.lines[i]!.soft;
+    }
+    this.lineNos = nos;
+  }
+
+  private activeLineNo(): number {
+    const last = this.lines[this.lines.length - 1];
+    if (last?.soft) return 0;
+    let n = 0;
+    for (const no of this.lineNos) if (no > n) n = no;
+    return n + 1;
+  }
+
+  /**
+   * Only the rows that can be seen are drawn. Old ink fades as it climbs,
+   * and is gone entirely before it reaches the controls and the sticker at
+   * the top, so history never prints over them.
+   */
+  private rebuildStatic(p: Palette, fx: Tones): void {
+    this.renumber();
     const s = this.staticCtx;
     s.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    s.globalCompositeOperation = "source-over";
     s.clearRect(0, 0, this.w, this.h);
     s.textBaseline = "alphabetic";
-    const n = this.baked.length;
-    for (let i = 0; i < n; i++) {
-      const rowFromActive = n - i;
-      const y = this.typingY - this.lineHeight * rowFromActive;
-      if (y < -this.lineHeight) continue;
-      const fade = clamp(1 - (rowFromActive - 3) * 0.045, 0.3, 1);
+    const n = this.lines.length;
+    const { clearTop, fadeTop } = this.historyFade();
+    for (let row = 1; row <= n; row++) {
+      const y = this.typingY - this.lineHeight * row;
+      if (y < clearTop) break;
+      const fade = clamp(1 - (row - 2) * 0.06, 0.35, 1);
       s.globalAlpha = fade;
-      this.drawBakedLine(s, this.baked[i]!, y, p.ink);
+      const line = this.lines[n - row]!;
+      this.drawBakedLine(s, line.glyphs, y, p.ink);
+      line.marks.forEach((id, k) => {
+        const d = doodleById(id);
+        if (d) this.drawMark(s, d, k, y, fx, fade * 0.8);
+      });
     }
     s.globalAlpha = 1;
+    // Dissolve the top of the history into the paper.
+    s.globalCompositeOperation = "destination-out";
+    const grad = s.createLinearGradient(0, clearTop, 0, fadeTop);
+    grad.addColorStop(0, "rgba(0,0,0,1)");
+    grad.addColorStop(1, "rgba(0,0,0,0)");
+    s.fillStyle = grad;
+    s.fillRect(0, 0, this.w, fadeTop);
+    s.globalCompositeOperation = "source-over";
     this.staticDirty = false;
-    void now;
+  }
+
+  /** Where history must be gone by (clearTop) and starts to fade (fadeTop). */
+  private historyFade(): { clearTop: number; fadeTop: number } {
+    const clearTop = Math.max(this.prefs.chrome || this.prefs.caption ? 96 : 40, this.fs * 2.4);
+    const room = this.typingY - this.lineHeight - clearTop;
+    const fadeTop = clearTop + clamp(room * 0.45, 0, this.lineHeight * 3.5);
+    return { clearTop, fadeTop };
   }
 
   /** Draw a baked line, batching runs of equal weight into single fillText calls. */
@@ -959,10 +1695,12 @@ export class Engine {
     }
   }
 
+  /** Multiplier on the active row's ink, lowered while Esc lifts the sheet. */
+  private inkAlpha = 1;
+
   private drawActiveLine(
-    p: Palette,
     sd: StyleDef,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -973,12 +1711,28 @@ export class Engine {
       const age = now - g.born;
       const land = mm > 0 ? landCurve(age / LAND_MS) : 1;
       const settling = land < 0.999 || age < 600;
-      const alpha = Math.min(1, age / 45);
+      const alpha = Math.min(1, age / 45) * this.inkAlpha;
       const weight = this.glyphWeight(g, now);
       const dryT = g.upAt === null ? 0 : Math.min(1, (now - g.upAt) / DRY_MS);
-      const x = this.colX(i);
+      let x = this.colX(i);
       let y = this.typingY;
       let xOff = 0;
+      if (this.waves.length) {
+        const [wx, wy] = this.waveAt(x + this.advance / 2, y - this.fs * 0.35, now);
+        x += wx;
+        y += wy;
+      }
+
+      // A word carried down by the wrap hops from where it was.
+      if (g.carry) {
+        const ct = (now - g.carry.at) / CARRY_MS;
+        if (ct >= 1) g.carry = null;
+        else {
+          const e = ct <= 0 ? 0 : easeOut(ct);
+          x += g.carry.dx * (1 - e);
+          y += g.carry.dy * (1 - e) - Math.sin(Math.PI * clamp(ct, 0, 1)) * this.fs * 0.45 * mm;
+        }
+      }
 
       // How this style's glyphs arrive.
       if (settling && mm > 0) {
@@ -1011,15 +1765,15 @@ export class Engine {
         const mis = this.heat * 2.8 * mm * (1 - Math.min(1, age / 600));
         if (mis > 0.35) {
           ctx.globalAlpha = alpha * 0.55;
-          ctx.fillStyle = fx.misA;
+          ctx.fillStyle = fx.misAS;
           ctx.fillText(g.ch, x - mis, y + mis * 0.4);
-          ctx.fillStyle = fx.misB;
+          ctx.fillStyle = fx.misBS;
           ctx.fillText(g.ch, x + mis, y - mis * 0.3);
         }
       }
 
       ctx.globalAlpha = alpha;
-      ctx.fillStyle = dryT >= 1 ? p.ink : mixHex(fx.fresh, p.ink, dryT);
+      ctx.fillStyle = dryT >= 1 ? fx.inkS : css(mix(fx.fresh, fx.ink, dryT));
 
       // A freshly stamped letter pulses down into the page.
       let stampScale = 1;
@@ -1032,8 +1786,7 @@ export class Engine {
       const glowing =
         sd.glow > 1 && mm > 0 && dryT < 0.5 && this.heat > 0.08 && age < 1500;
       if (glowing) {
-        ctx.save();
-        ctx.shadowColor = fx.fresh;
+        ctx.shadowColor = fx.freshS;
         ctx.shadowBlur = (1 - dryT) * 9 * this.heat * sd.glow * mm;
       }
 
@@ -1068,18 +1821,19 @@ export class Engine {
       } else {
         ctx.fillText(g.ch, x + xOff, y);
       }
+      if (glowing) ctx.shadowBlur = 0;
     }
     ctx.globalAlpha = 1;
   }
 
-  private drawDying(p: Palette, now: number): void {
+  private drawDying(fx: Tones, now: number): void {
     const ctx = this.ctx;
     this.dying = this.dying.filter((d) => now - d.at < 95);
     for (const d of this.dying) {
       const t = (now - d.at) / 95;
       ctx.globalAlpha = (1 - t) * 0.8;
       ctx.font = this.font(d.w);
-      ctx.fillStyle = p.fresh;
+      ctx.fillStyle = fx.freshS;
       ctx.fillText(d.ch, d.x + t * this.advance * 0.35, this.typingY + t * 3);
     }
     ctx.globalAlpha = 1;
@@ -1091,7 +1845,7 @@ export class Engine {
    * the hero even at maximum impact.
    */
   private drawStamps(
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1100,10 +1854,11 @@ export class Engine {
     this.stamps = this.stamps.filter((s) => now - s.at < 340);
     for (const s of this.stamps) {
       const t = (now - s.at) / 340;
+      if (t < 0) continue;
       const sc = 1 + (0.7 + s.power * 0.9) * easeOut(t) * mm;
       ctx.globalAlpha = (1 - t) * (0.3 + s.power * 0.25);
       ctx.font = this.font(s.w);
-      ctx.strokeStyle = fx.fresh;
+      ctx.strokeStyle = fx.freshS;
       ctx.lineWidth = 1.1;
       ctx.save();
       ctx.translate(s.x + this.advance / 2, this.typingY - this.fs * 0.33);
@@ -1200,7 +1955,7 @@ export class Engine {
   }
 
   private drawParticles(
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number
   ): void {
     if (this.particles.length === 0) return;
@@ -1215,7 +1970,7 @@ export class Engine {
           const x = pt.x0 + pt.vx * s + Math.sin(pt.seed * 9 + age / 160) * 3;
           const y = pt.y0 + pt.vy * s - 26 * s * s;
           ctx.globalAlpha = (1 - t) * 0.85;
-          ctx.fillStyle = t < 0.35 ? fx.misA : fx.fresh;
+          ctx.fillStyle = t < 0.35 ? fx.misAS : fx.freshS;
           ctx.beginPath();
           ctx.arc(x, y, Math.max(0.6, 2.2 * (1 - t * 0.6)), 0, Math.PI * 2);
           ctx.fill();
@@ -1224,7 +1979,7 @@ export class Engine {
         case "ring": {
           const r = 3 + 17 * easeOut(t);
           ctx.globalAlpha = (1 - t) * 0.45;
-          ctx.strokeStyle = fx.fresh;
+          ctx.strokeStyle = fx.freshS;
           ctx.lineWidth = 1.2;
           ctx.beginPath();
           ctx.ellipse(pt.x0, pt.y0, r, r * 0.34, 0, 0, Math.PI * 2);
@@ -1236,7 +1991,7 @@ export class Engine {
           const y = pt.y0 + pt.vy * s;
           const tw = 0.5 + 0.5 * Math.sin(age / 90 + pt.seed * 9);
           ctx.globalAlpha = (1 - t) * tw * 0.9;
-          ctx.fillStyle = fx.misA;
+          ctx.fillStyle = fx.misAS;
           ctx.save();
           ctx.translate(x, y);
           ctx.rotate(Math.PI / 4);
@@ -1248,7 +2003,7 @@ export class Engine {
           const x = pt.x0 + pt.vx * s;
           const y = pt.y0 + Math.sin(age / 230 + pt.seed * 7) * 6 + 12 * s;
           ctx.globalAlpha = (1 - t) * 0.65;
-          ctx.fillStyle = fx.fresh;
+          ctx.fillStyle = fx.freshS;
           ctx.beginPath();
           ctx.ellipse(x, y, 2.6, 1.1, pt.seed * 3 + age / 500, 0, Math.PI * 2);
           ctx.fill();
@@ -1265,7 +2020,7 @@ export class Engine {
    * feels alive. Short and low-contrast so it reads as feedback, not noise.
    */
   private drawRipples(
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1276,23 +2031,13 @@ export class Engine {
       const t = (now - r.at) / 300;
       const rad = (5 + 24 * easeOut(t)) * (0.7 + r.power * 0.5);
       ctx.globalAlpha = (1 - t) * 0.3 * r.power * mm;
-      ctx.strokeStyle = fx.fresh;
+      ctx.strokeStyle = fx.freshS;
       ctx.lineWidth = 1.6 * (1 - t) + 0.4;
       ctx.beginPath();
       ctx.arc(r.x, r.y, rad, 0, Math.PI * 2);
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-  }
-
-  private withAlpha(color: string, a: number): string {
-    if (color[0] === "#") {
-      const v = parseInt(color.slice(1), 16);
-      return `rgba(${(v >> 16) & 255},${(v >> 8) & 255},${v & 255},${a})`;
-    }
-    const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(color);
-    if (m) return `rgba(${m[1]},${m[2]},${m[3]},${a})`;
-    return color;
   }
 
   /**
@@ -1304,8 +2049,7 @@ export class Engine {
    * margin, marking the lines you have actually written.
    */
   private drawRules(
-    p: Palette,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1318,6 +2062,10 @@ export class Engine {
     const numX = this.marginX - this.fs * 0.5;
     const small = Math.round(this.fs * 0.42);
     const flash = clamp(1 - (now - this.lastInput) / 160, 0, 1);
+    const horizon = css(mix(fx.sub, fx.fresh, 0.5));
+    if (this.staticDirty) this.renumber();
+    const activeNo = this.activeLineNo();
+    const { clearTop } = this.historyFade();
 
     ctx.textBaseline = "alphabetic";
     // Iterate every line slot on screen; i is offset in lines from the
@@ -1333,7 +2081,7 @@ export class Engine {
       const baseA = active
         ? 0.34 + this.heat * 0.14 + flash * 0.18
         : clamp(0.12 - dist * 0.012, 0.03, 0.12);
-      ctx.strokeStyle = active ? mixHex(p.sub, p.fresh, 0.5) : p.sub;
+      ctx.strokeStyle = active ? horizon : fx.subS;
       ctx.globalAlpha = baseA;
       ctx.lineWidth = active ? 1.4 : 1;
       ctx.beginPath();
@@ -1341,16 +2089,21 @@ export class Engine {
       ctx.lineTo(right, Math.round(y) + 0.5);
       ctx.stroke();
 
-      // Line number, only for lines that have been written (active + history).
-      const lineNo = this.baked.length + 1 + i; // i<0 are earlier committed lines
-      if (lineNo >= 1 && i <= 0) {
-        const numA = active ? 0.4 : clamp(0.18 - dist * 0.02, 0.05, 0.18);
-        ctx.globalAlpha = numA;
-        ctx.fillStyle = active ? mixHex(p.sub, p.fresh, 0.5) : p.sub;
-        ctx.font = this.font(active ? 560 : 440, small);
-        const label = String(lineNo);
-        const tw = ctx.measureText(label).width;
-        ctx.fillText(label, numX - tw, y - this.fs * 0.2);
+      // Line numbers for the rows that have been written. A row that
+      // continues a wrapped line gets a quiet tick instead of a number.
+      const row = this.lines.length + i; // index into lines; == length is active
+      if (i <= 0 && row >= 0 && y - this.fs * 0.2 > clearTop) {
+        const no = active ? activeNo : this.lineNos[row]!;
+        ctx.globalAlpha = active ? 0.4 : clamp(0.18 - dist * 0.02, 0.05, 0.18);
+        ctx.fillStyle = active ? horizon : fx.subS;
+        if (no > 0) {
+          ctx.font = this.font(active ? 560 : 440, small);
+          const label = String(no);
+          const tw = ctx.measureText(label).width;
+          ctx.fillText(label, numX - tw, y - this.fs * 0.2);
+        } else {
+          ctx.fillRect(numX - small * 0.55, y - this.fs * 0.2 - small * 0.32, small * 0.4, 1.5);
+        }
       }
     }
 
@@ -1362,8 +2115,8 @@ export class Engine {
         const cx = clamp(this.caretX.x, left, right);
         const r = this.fs * (2.4 + this.heat * 2);
         const grad = ctx.createRadialGradient(cx, ruleY, 0, cx, ruleY, r);
-        grad.addColorStop(0, this.withAlpha(fx.fresh, glow * 0.6));
-        grad.addColorStop(1, this.withAlpha(fx.fresh, 0));
+        grad.addColorStop(0, css(fx.fresh, glow * 0.6));
+        grad.addColorStop(1, css(fx.fresh, 0));
         ctx.fillStyle = grad;
         ctx.fillRect(cx - r, ruleY - this.fs * 0.5, r * 2, this.fs);
       }
@@ -1377,9 +2130,8 @@ export class Engine {
    * backspace. The one element that is never still.
    */
   private drawCaret(
-    p: Palette,
     sd: StyleDef,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1401,21 +2153,21 @@ export class Engine {
     const flash = clamp(1 - (now - this.lastInput) / 140, 0, 1);
     const glow = (18 * this.heat + 12 * flash) * sd.glow * mm;
     if (glow > 0.5 && mm > 0) {
-      ctx.shadowColor = fx.fresh;
+      ctx.shadowColor = fx.freshS;
       ctx.shadowBlur = glow;
     }
     // Speed smear: ghost carets trail behind fast movement.
     if (Math.abs(this.caretX.v) > 600 && mm > 0) {
       const smear = clamp(this.caretX.v * 0.014, -this.advance * 2, this.advance * 2);
       ctx.globalAlpha = blink * 0.14;
-      ctx.fillStyle = fx.fresh;
+      ctx.fillStyle = fx.freshS;
       ctx.fillRect(-smear, -chh, cw, chh);
       ctx.globalAlpha = blink * 0.07;
       ctx.fillRect(-smear * 1.8, -chh, cw, chh);
     }
     ctx.globalAlpha = blink;
     // A keystroke briefly tints the caret toward the fresh accent.
-    ctx.fillStyle = this.shiftHeld ? fx.fresh : flash > 0.05 ? mixHex(p.ink, p.fresh, flash * 0.6) : p.ink;
+    ctx.fillStyle = this.shiftHeld ? fx.freshS : flash > 0.05 ? css(mix(fx.ink, fx.fresh, flash * 0.6)) : fx.inkS;
     ctx.fillRect(0, -chh, cw, chh);
     ctx.restore();
     ctx.globalAlpha = 1;
@@ -1423,7 +2175,7 @@ export class Engine {
 
   private drawSeismo(
     p: Palette,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number
   ): void {
     const ctx = this.ctx;
@@ -1443,7 +2195,7 @@ export class Engine {
     // Milestone flash: the whole baseline lights up for a beat.
     const flashT = (now - this.seismoFlashAt) / 450;
     if (flashT < 1) {
-      ctx.strokeStyle = fx.fresh;
+      ctx.strokeStyle = fx.freshS;
       ctx.globalAlpha = (1 - flashT) * 0.85;
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -1461,7 +2213,7 @@ export class Engine {
       const gap = i > 0 ? t - ticks[i - 1]! : 400;
       const hgt = clamp(1400 / Math.max(gap, 40), 3, 18);
       const recent = clamp(1 - (now - t) / SEISMO_SPAN, 0, 1);
-      ctx.strokeStyle = this.heat > 0.2 && now - t < 1500 ? fx.fresh : p.sub;
+      ctx.strokeStyle = this.heat > 0.2 && now - t < 1500 ? fx.freshS : p.sub;
       ctx.globalAlpha = 0.25 + 0.55 * recent;
       ctx.beginPath();
       ctx.moveTo(x, yMid - hgt);
@@ -1472,28 +2224,39 @@ export class Engine {
   }
 
   private captionA = 0;
+  /** Pace shown on the sticker; holds its last value while you pause. */
+  private shownWpm = 0;
+  private stickerHeat = 0;
 
+  /**
+   * The pace sticker. Once you start typing it stays: live while your hands
+   * are moving, holding your last pace when you pause, and loudest in flow
+   * (full slab, tilt and punch). Milestones take it over for a beat. F6
+   * hides it.
+   */
   private drawCaption(
     p: Palette,
     sd: StyleDef,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number
   ): void {
     const override = this.captionOverride && now < this.captionOverride.until
       ? this.captionOverride
       : null;
     if (this.captionOverride && !override) this.captionOverride = null;
-    const flowOn =
-      override !== null ||
-      (this.prefs.caption && this.heat > 0.12 && this.emaWpm > 38 && now - this.lastInput < 900);
-    this.captionA += ((flowOn ? 1 : 0) - this.captionA) * 0.12;
+    const k = 1 - Math.exp(-this.dt * 7.5);
+    const typing = now - this.lastInput < 1500;
+    if (typing) this.shownWpm += (this.rhythm.pace(now) - this.shownWpm) * k;
+    const on = override !== null || (this.prefs.caption && this.hasTyped);
+    this.captionA += ((on ? 1 : 0) - this.captionA) * k;
+    this.stickerHeat += ((override || this.heat > 0.12 ? 1 : 0) - this.stickerHeat) * k * 0.6;
     if (this.captionA < 0.02) return;
     const print = sd.id === "print";
     void fx;
 
     const ctx = this.ctx;
     const fsC = Math.round(this.fs * 0.78);
-    const text = override ? override.text : `${Math.round(this.emaWpm)} WPM`;
+    const text = override ? override.text : `${Math.round(this.shownWpm)} WPM`;
     ctx.font = this.font(800, fsC);
     const tw = ctx.measureText(text).width;
     const pad = fsC * 0.7;
@@ -1501,18 +2264,20 @@ export class Engine {
     const bh = fsC * 1.9;
     const cx = this.w - this.marginX - bw / 2;
     const cy = 64;
+    const hot = this.stickerHeat;
 
     ctx.save();
-    ctx.globalAlpha = this.captionA;
+    // Calm when you pause, loud in flow.
+    ctx.globalAlpha = this.captionA * (typing || override ? 0.85 + 0.15 * hot : 0.85);
     ctx.translate(cx, cy);
-    ctx.rotate(-0.045);
+    ctx.rotate(-0.045 * (0.35 + 0.65 * hot));
     const punch = 1 + clamp(this.captionPunch.x, 0, 1.4) * 0.05;
     const popScale = (0.92 + 0.08 * this.captionA) * punch;
     ctx.scale(popScale, popScale);
 
     if (print) {
       ctx.fillStyle = p.ink;
-      ctx.fillRect(-bw / 2 + 4, -bh / 2 + 5, bw, bh);
+      ctx.fillRect(-bw / 2 + 1 + 3 * hot, -bh / 2 + 1 + 4 * hot, bw, bh);
     }
     ctx.fillStyle = p.captionBg;
     ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
@@ -1544,7 +2309,7 @@ export class Engine {
    * typed; fades from view forever the moment there is text.
    */
   private drawWelcome(p: Palette, now: number): void {
-    if (this.hasTyped || this.baked.length || this.active.length) return;
+    if (this.hasTyped || this.lines.length || this.active.length) return;
     if (this.helpOpen || this.statsOpen) return;
     if (now - this.bootAt < 600) return;
     const ctx = this.ctx;
@@ -1594,7 +2359,7 @@ export class Engine {
 
     ctx.font = this.font(460, small);
     const status = `${this.palette().label} · ${sd.label}`;
-    const controls = "F1 help   F4 style   Esc clear   Ctrl+S print";
+    const controls = "F1 help   F4 style   F8 doodles   hold Esc clear   Ctrl+S proof";
 
     ctx.globalAlpha = a;
     ctx.fillStyle = p.sub;
@@ -1633,6 +2398,359 @@ export class Engine {
     ctx.globalAlpha = 1;
   }
 
+  /** Size of a margin doodle and where the k-th one sits on a row. */
+  private markSize(): number {
+    return Math.min(this.fs * 0.7, this.marginX * 0.24);
+  }
+
+  /** Margin doodles sit side by side just past the text, never over it. */
+  private markX(k: number): number {
+    const s = this.markSize();
+    return this.w - this.marginX * 0.88 + s / 2 + k * s * 1.12;
+  }
+
+  /** A settled doodle in a row's right margin, baseline y. */
+  private drawMark(
+    c: CanvasRenderingContext2D,
+    d: Doodle,
+    k: number,
+    y: number,
+    fx: Tones,
+    alpha: number
+  ): void {
+    const size = this.markSize();
+    c.save();
+    c.globalAlpha = alpha;
+    this.strokeDoodle(c, d, this.markX(k), y - this.fs * 0.35, size, 1, fx, null, 1.3);
+    c.restore();
+  }
+
+  /**
+   * Ink a doodle centered on (cx, cy) at `size` px. `progress` 0..1 is how
+   * much of it the pen has drawn. With a paper color, a wide paper stroke
+   * goes down first so the doodle reads cleanly over text, like a sticker.
+   */
+  private strokeDoodle(
+    c: CanvasRenderingContext2D,
+    d: Doodle,
+    cx: number,
+    cy: number,
+    size: number,
+    progress: number,
+    fx: Tones,
+    paper: string | null,
+    strokePx: number
+  ): void {
+    const paths = doodlePaths(d);
+    const k = size / 24;
+    c.save();
+    c.translate(cx, cy);
+    c.scale(k, k);
+    c.translate(-12, -12);
+    c.lineCap = "round";
+    c.lineJoin = "round";
+    const dash = 96;
+    if (progress < 1) {
+      c.setLineDash([dash, dash]);
+      c.lineDashOffset = dash * (1 - progress);
+    }
+    if (paper) {
+      c.strokeStyle = paper;
+      c.lineWidth = (strokePx * 3.2) / k;
+      for (const ph of paths) c.stroke(ph);
+    }
+    const inks = [fx.freshS, fx.misAS, fx.misBS];
+    c.lineWidth = strokePx / k;
+    paths.forEach((ph, i) => {
+      c.strokeStyle = inks[Math.min(i, 2)]!;
+      c.stroke(ph);
+    });
+    if (d.fill && progress >= 1) {
+      const a = c.globalAlpha;
+      c.globalAlpha = a * 0.2;
+      c.fillStyle = fx.freshS;
+      c.fill(paths[0]!);
+      c.globalAlpha = a;
+    }
+    c.restore();
+  }
+
+  /**
+   * Doodles in the air. The pen draws each one above its word, it does its
+   * one thing, then it fades as its copy settles into the margin. They ride
+   * the history up when a line is committed.
+   */
+  private drawSprites(p: Palette, fx: Tones, now: number, mm: number, slide: number): void {
+    if (this.sprites.length === 0) return;
+    this.sprites = this.sprites.filter((sp) => now - sp.at < DOODLE_LIFE);
+    const ctx = this.ctx;
+    const size = this.fs * 1.55;
+    const unit = size / 24;
+    const { clearTop } = this.historyFade();
+    for (const sp of this.sprites) {
+      const t = now - sp.at;
+      const pz = pose(sp.d.motion, t, sp.seed, mm);
+      const rowsUp = this.lines.length - sp.row;
+      const shift = rowsUp > 0 ? -rowsUp * this.lineHeight + slide : 0;
+      const baseY = this.typingY - this.fs * 0.95 + shift;
+      const cy = pz.base ? baseY - size / 2 : baseY - size * 0.6;
+      if (cy < clearTop) continue;
+      const progress = mm > 0 ? clamp(t / DOODLE_DRAW, 0, 1) : 1;
+      const appear = mm > 0 ? 1 : clamp(t / 200, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = pz.alpha * appear;
+      ctx.translate(sp.x + pz.dx * unit, (pz.base ? baseY : cy) + pz.dy * unit);
+      ctx.rotate(pz.rot);
+      ctx.scale(pz.sx, pz.sy);
+      const oy = pz.base ? -size / 2 : 0;
+      this.drawSpriteExtras(sp.d, t, unit, oy, size, fx, mm);
+      this.strokeDoodle(ctx, sp.d, 0, oy, size, progress, fx, p.paper, Math.max(1.8, this.fs * 0.075));
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /** The little extra each moving doodle brings: rain, speed lines, exhaust. */
+  private drawSpriteExtras(
+    d: Doodle,
+    t: number,
+    unit: number,
+    oy: number,
+    size: number,
+    fx: Tones,
+    mm: number
+  ): void {
+    if (mm === 0 || t < DOODLE_DRAW) return;
+    const ctx = this.ctx;
+    const a = (t - DOODLE_DRAW) / 1000;
+    ctx.lineCap = "round";
+    if (d.motion === "fall") {
+      ctx.strokeStyle = fx.misAS;
+      ctx.lineWidth = 1.4;
+      for (let i = 0; i < 6; i++) {
+        const ph = (a * 1.4 + i / 6) % 1;
+        const x = (-7 + (i % 3) * 7 + (i > 2 ? 3 : 0)) * unit;
+        const y = oy + size * 0.3 + ph * size * 1.1;
+        ctx.globalAlpha = (1 - ph) * 0.8;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x - unit, y + unit * 2.4);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    } else if (d.motion === "drive") {
+      const v = Math.min(1, a * 1.5);
+      ctx.strokeStyle = fx.subS;
+      ctx.lineWidth = 1.4;
+      for (let i = 0; i < 3; i++) {
+        const y = oy + (2 + i * 3.5) * unit;
+        const len = (8 + i * 5) * unit * v * (1 + a * 2);
+        ctx.globalAlpha = 0.6 * v;
+        ctx.beginPath();
+        ctx.moveTo(-size * 0.55, y);
+        ctx.lineTo(-size * 0.55 - len, y);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    } else if (d.motion === "launch") {
+      ctx.fillStyle = fx.subS;
+      for (let i = 0; i < 5; i++) {
+        const ph = (a * 2.2 + i / 5) % 1;
+        ctx.globalAlpha = (1 - ph) * 0.5;
+        ctx.beginPath();
+        ctx.arc(Math.sin(i * 7) * 3 * unit * ph, oy + size * 0.45 + ph * size * 0.8, (1 + ph * 3) * unit, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else if (d.motion === "flash" && a < 0.25) {
+      ctx.globalAlpha = (1 - a / 0.25) * 0.35;
+      ctx.fillStyle = fx.misAS;
+      ctx.beginPath();
+      ctx.arc(0, oy, size * (0.6 + a * 2), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /** Doodles settling into the active row's margin. */
+  private drawActiveMarks(fx: Tones, now: number): void {
+    if (this.activeMarks.length === 0) return;
+    const ctx = this.ctx;
+    this.activeMarks.forEach((id, k) => {
+      const d = doodleById(id);
+      const since = now - this.activeMarkAt[k]!;
+      if (!d || since < 0) return;
+      ctx.save();
+      ctx.globalAlpha = clamp(since / 500, 0, 1) * 0.8 * this.inkAlpha;
+      this.strokeDoodle(ctx, d, this.markX(k), this.typingY - this.fs * 0.35, this.markSize(), clamp(since / 400, 0, 1), fx, null, 1.3);
+      ctx.restore();
+    });
+  }
+
+  /**
+   * Esc held: a hairline of fresh ink draws itself along the horizon, left
+   * to right, as the sheet lifts. When it reaches the margin, the sheet goes.
+   */
+  private drawEscHold(fx: Tones, lift: number): void {
+    const ctx = this.ctx;
+    const t = clamp(lift, 0, 1);
+    const left = Math.round(this.marginX * 0.6);
+    const right = Math.round(this.w - this.marginX * 0.6);
+    const y = Math.round(this.typingY + this.fs * 0.2) + 0.5;
+    ctx.globalAlpha = 0.25 + 0.6 * t;
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(left + (right - left) * t, y);
+    ctx.stroke();
+    ctx.lineCap = "butt";
+    ctx.globalAlpha = 1;
+  }
+
+  /** The faint ring of each click wave, so it reads on empty paper too. */
+  private drawWaveFronts(fx: Tones, now: number): void {
+    const ctx = this.ctx;
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = 1.2;
+    for (const w of this.waves) {
+      const t = clamp((now - w.at) / 1600, 0, 1);
+      ctx.globalAlpha = 0.16 * (1 - t) * (1 - t);
+      ctx.beginPath();
+      ctx.arc(w.x, w.y, Math.max(0, now - w.at) * 0.95, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /**
+   * "lights out": a gantry of five reds lights up one a second, holds for
+   * a random beat, then everything goes out. Away we go.
+   */
+  private drawLights(now: number, mm: number): void {
+    const L = this.lights!;
+    const t = now - L.at;
+    const after = now - L.outAt;
+    if (after > 900) {
+      this.lights = null;
+      return;
+    }
+    const ctx = this.ctx;
+    const r = Math.max(9, this.fs * 0.42);
+    const gap = r * 2.7;
+    const cx = this.w / 2;
+    const cy = Math.max(r * 3, 70);
+    const fade = after > 0 ? 1 - after / 900 : Math.min(1, t / 200);
+    const drop = after > 0 && mm > 0 ? easeOut(after / 900) * -40 : 0;
+    ctx.globalAlpha = fade;
+    ctx.fillStyle = "#16161a";
+    const bw = gap * 5;
+    ctx.beginPath();
+    ctx.roundRect(cx - bw / 2, cy - r * 1.6 + drop, bw, r * 3.2, r * 0.6);
+    ctx.fill();
+    for (let i = 0; i < 5; i++) {
+      const lit = after < 0 && t >= i * 1000;
+      const x = cx - bw / 2 + gap * (i + 0.5);
+      if (lit) {
+        ctx.shadowColor = "#ff2a1a";
+        ctx.shadowBlur = r * 1.6;
+      }
+      ctx.fillStyle = lit ? "#ff2a1a" : "#3a3a40";
+      ctx.beginPath();
+      ctx.arc(x, cy + drop, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /** The silent margin bell: a short accent tick at the right margin. */
+  private drawBell(fx: Tones, now: number, mm: number): void {
+    const t = (now - this.bellAt) / 420;
+    if (t < 0 || t >= 1) return;
+    const ctx = this.ctx;
+    const x = this.colX(this.maxCols) + this.advance * 0.6;
+    const y = this.typingY - this.fs * 0.35;
+    const r = this.fs * (0.28 + 0.5 * easeOut(t) * Math.max(mm, 0.3));
+    ctx.globalAlpha = (1 - t) * 0.8;
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(x, y, r, -Math.PI * 0.35, Math.PI * 0.35);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.55, -Math.PI * 0.3, Math.PI * 0.3);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  /**
+   * The ink bloom. The frame from before the change is drawn on top with a
+   * hole in it, and the hole grows: an irregular, slightly lobed blot, the
+   * way a drop spreads through damp paper, with a darker tide line where
+   * the wet edge is. Without motion it is a plain cross-fade.
+   */
+  private drawBloom(fx: Tones, now: number, mm: number): void {
+    const b = this.bloom!;
+    const ctx = this.ctx;
+    const dur = mm >= 1 ? BLOOM_MS : mm > 0 ? BLOOM_MS * 0.7 : 280;
+    const t = (now - b.at) / dur;
+    if (t >= 1) {
+      this.bloom = null;
+      return;
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (mm === 0) {
+      ctx.globalAlpha = 1 - t;
+      ctx.drawImage(b.canvas, 0, 0);
+      ctx.restore();
+      return;
+    }
+    // Reach: far enough to cover the farthest corner, with lobes to spare.
+    const reach =
+      Math.hypot(Math.max(b.x, this.w - b.x), Math.max(b.y, this.h - b.y)) * 1.18;
+    // Fast at first, slowing as it soaks out, like real ink.
+    const e = 1 - Math.pow(1 - t, 1.8);
+    const r0 = reach * e;
+    // Enough points that the edge stays a curve even at full-screen size.
+    const steps = Math.min(360, Math.max(48, Math.round(r0 / 6)));
+    const blot = new Path2D();
+    for (let k = 0; k <= steps; k++) {
+      const a = (k / steps) * Math.PI * 2;
+      const wob =
+        1 +
+        0.07 * Math.sin(a * 3 + b.seed) +
+        0.045 * Math.sin(a * 7 - b.seed * 1.7 + t * 2) +
+        0.025 * Math.sin(a * 13 + b.seed * 0.3);
+      const r = r0 * wob;
+      const px = (b.x + Math.cos(a) * r) * this.dpr;
+      const py = (b.y + Math.sin(a) * r) * this.dpr;
+      if (k === 0) blot.moveTo(px, py);
+      else blot.lineTo(px, py);
+    }
+    blot.closePath();
+
+    const hole = new Path2D();
+    hole.rect(0, 0, this.canvas.width, this.canvas.height);
+    hole.addPath(blot);
+    ctx.save();
+    ctx.clip(hole, "evenodd");
+    ctx.drawImage(b.canvas, 0, 0);
+    ctx.restore();
+
+    // The tide line: wet ink pools at the edge of the spread.
+    ctx.globalAlpha = 0.5 * (1 - t) * (1 - t);
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = (1.5 + 5 * (1 - t)) * this.dpr;
+    ctx.stroke(blot);
+    ctx.globalAlpha = 0.18 * (1 - t);
+    ctx.lineWidth = (8 + 18 * (1 - t)) * this.dpr;
+    ctx.stroke(blot);
+    ctx.restore();
+  }
+
   private drawHalftoneBands(p: Palette): void {
     const ctx = this.ctx;
     if (!this.dotPattern) {
@@ -1662,11 +2780,11 @@ export class Engine {
   private overlayPanel(p: Palette): { x: number; y: number; pw: number } {
     const ctx = this.ctx;
     ctx.fillStyle = p.paper;
-    ctx.globalAlpha = 0.94;
+    ctx.globalAlpha = 0.97;
     ctx.fillRect(0, 0, this.w, this.h);
     ctx.globalAlpha = 1;
-    const pw = Math.min(620, this.w - 64);
-    return { x: (this.w - pw) / 2, y: Math.max(56, this.h * 0.14), pw };
+    const pw = Math.min(1000, this.w - 64);
+    return { x: (this.w - pw) / 2, y: Math.max(56, this.h * 0.12), pw };
   }
 
   private drawHelp(p: Palette, sd: StyleDef): void {
@@ -1685,10 +2803,11 @@ export class Engine {
       ["F7", `motion: ${["off", "subtle", "full"][this.prefs.motion]}`],
       ["F8", "keystroke odometer"],
       ["F9", `controls strip ${this.prefs.chrome ? "(shown)" : "(hidden)"}`],
-      ["Esc", "clear the page"],
-      ["Ctrl+Z", "bring back what you cleared"],
+      ["hold Esc", "clear the page"],
+      ["Ctrl+Z", "bring back what you cleared, even after a reload"],
       ["Ctrl+C", "copy everything you typed"],
-      ["Ctrl+S", "save a print of your session"]
+      ["Ctrl+S", "pull a rhythm proof of your session"],
+      ["click", "send a ripple through the letters"]
     ];
 
     const aboutLines = [
@@ -1700,8 +2819,9 @@ export class Engine {
       "tap a key: light. hold it: heavier. the page remembers.",
       "hold, then release: the letter stamps. feel the thump.",
       "type with an even rhythm and the page warms up to it.",
-      "the page knows words: fire, water, ice, wind, zen.",
-      "Ctrl+S saves a print of your rhythm."
+      "fire, water, ice, wind or zen alone on a line, then Enter.",
+      "some words draw themselves. F8 shows the ones you've found.",
+      "Ctrl+S pulls a proof, sealed with your rhythm."
     ];
 
     // Adaptive type size: fit by height AND by the widest line, so the
@@ -1780,14 +2900,14 @@ export class Engine {
     for (const line of inkLines) body(line);
   }
 
-  private drawStats(p: Palette): void {
+  private drawStats(p: Palette, fx: Tones): void {
     const ctx = this.ctx;
-    const { x, y } = this.overlayPanel(p);
-    const small = Math.round(this.fs * 0.6);
+    const { x, y, pw } = this.overlayPanel(p);
+    const small = Math.round(Math.min(this.fs * 0.6, (this.h - y) / 26));
     let cy = y;
 
     ctx.fillStyle = p.ink;
-    ctx.font = this.font(760, Math.round(this.fs * 1.5));
+    ctx.font = this.font(760, Math.round(small * 2.5));
     ctx.fillText("odometer", x, cy);
     cy += small * 3.4;
 
@@ -1796,7 +2916,8 @@ export class Engine {
       ["lifetime keystrokes", fmt(this.odo.total)],
       ["this session", fmt(this.sessionKeys)],
       ["best flow", this.odo.bestWpm ? `${this.odo.bestWpm} WPM` : "not yet"],
-      ["longest streak", this.odo.bestStreak ? fmt(this.odo.bestStreak) : "not yet"]
+      ["longest streak", this.odo.bestStreak ? fmt(this.odo.bestStreak) : "not yet"],
+      ["biggest roll", this.odo.bestRoll >= 3 ? `${this.odo.bestRoll} keys at once` : "not yet"]
     ];
     for (const [label, val] of rows) {
       ctx.font = this.font(440, small);
@@ -1804,11 +2925,14 @@ export class Engine {
       ctx.fillText(label, x, cy);
       ctx.font = this.font(660, small);
       ctx.fillStyle = p.ink;
-      ctx.fillText(val, x + small * 14, cy);
+      ctx.fillText(val, x + small * 12, cy);
       cy += small * 1.95;
     }
 
-    cy += small * 1.4;
+    // Two columns when there is room: keys on the left, doodles on the right.
+    const wide = pw >= 900;
+    const colY = cy + small * 1.4;
+    cy = colY;
     ctx.font = this.font(440, small);
     ctx.fillStyle = p.sub;
     ctx.fillText("most pressed", x, cy);
@@ -1822,7 +2946,7 @@ export class Engine {
       ctx.font = this.font(660, small);
       ctx.fillStyle = p.fresh;
       ctx.fillText(keyLabel(code), x, cy);
-      const barW = (count / maxCount) * small * 12;
+      const barW = (count / maxCount) * small * 10;
       ctx.fillStyle = p.sub;
       ctx.globalAlpha = 0.5;
       ctx.fillRect(x + small * 6, cy - small * 0.62, barW, small * 0.7);
@@ -1832,5 +2956,31 @@ export class Engine {
       ctx.fillText(fmt(count), x + small * 6 + barW + small * 0.6, cy);
       cy += small * 1.95;
     }
+
+    // The doodle checklist: found ones drawn, the rest still a secret.
+    const gx = wide ? x + pw * 0.52 : x;
+    let gy = wide ? colY : cy + small * 1.2;
+    const found = new Set(this.odo.found);
+    ctx.font = this.font(440, small);
+    ctx.fillStyle = p.sub;
+    ctx.fillText(`doodles found  ${found.size} of ${DOODLES.length}`, gx, gy);
+    gy += small * 1.2;
+    const gw = wide ? pw * 0.48 : pw;
+    const perRow = wide ? 7 : Math.max(7, Math.floor(gw / (small * 2.4)));
+    const cell = Math.min(small * 2.6, gw / perRow);
+    DOODLES.forEach((d, i) => {
+      const cx = gx + (i % perRow) * cell + cell / 2;
+      const ccy = gy + Math.floor(i / perRow) * cell + cell / 2;
+      if (found.has(d.id)) {
+        this.strokeDoodle(ctx, d, cx, ccy, cell * 0.66, 1, fx, null, 1.4);
+      } else {
+        ctx.fillStyle = p.sub;
+        ctx.globalAlpha = 0.5;
+        ctx.beginPath();
+        ctx.arc(cx, ccy, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    });
   }
 }
