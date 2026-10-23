@@ -12,6 +12,7 @@
  * high resolution and handed back as a PNG download.
  */
 import type { Echo } from "./echo";
+import { mixHex } from "./palettes";
 
 export interface PrintPalette {
   paper: string;
@@ -31,16 +32,6 @@ export interface PrintStats {
 
 const FONT = `"JetBrains Mono Variable", ui-monospace, monospace`;
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5)); // ~2.399963
-
-function mix(a: string, b: string, t: number): string {
-  const pa = parseInt(a.slice(1), 16);
-  const pb = parseInt(b.slice(1), 16);
-  const ar = (pa >> 16) & 255, ag = (pa >> 8) & 255, ab = pa & 255;
-  const br = (pb >> 16) & 255, bg = (pb >> 8) & 255, bb = pb & 255;
-  return `rgb(${Math.round(ar + (br - ar) * t)},${Math.round(
-    ag + (bg - ag) * t
-  )},${Math.round(ab + (bb - ab) * t)})`;
-}
 
 export function renderRhythmPrint(
   echo: Echo,
@@ -109,7 +100,7 @@ export function renderRhythmPrint(
     let color: string;
     if (ev.ch === "\n") color = pal.misB;
     else if (ev.ch === " ") color = pal.sub;
-    else color = mix(pal.fresh, pal.sub, gap);
+    else color = mixHex(pal.fresh, pal.sub, gap);
     ctx.strokeStyle = color;
     ctx.globalAlpha = ev.ch === " " ? 0.4 : 0.82;
 

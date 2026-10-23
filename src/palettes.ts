@@ -203,14 +203,41 @@ export const PALETTES: Palette[] = [
   }
 ];
 
-/** Linear interpolation between two hex colors, t in [0, 1]. */
+/**
+ * Colors live as numbers. Palettes are authored in hex for readability,
+ * parsed once, mixed as [r, g, b] tuples and only turned into a CSS string
+ * at the moment a canvas needs one. Mixing a CSS string again would parse
+ * garbage, which is how fresh ink once went missing on light paper.
+ */
+export type RGB = readonly [number, number, number];
+
+const parsed = new Map<string, RGB>();
+
+/** Parse "#RRGGBB" (cached). */
+export function rgb(hex: string): RGB {
+  let c = parsed.get(hex);
+  if (!c) {
+    const v = parseInt(hex.slice(1), 16);
+    c = [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+    parsed.set(hex, c);
+  }
+  return c;
+}
+
+/** Linear interpolation between two colors, t in [0, 1]. */
+export function mix(a: RGB, b: RGB, t: number): RGB {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+/** CSS color string for a canvas, with optional alpha. */
+export function css(c: RGB, a = 1): string {
+  const r = Math.round(c[0]);
+  const g = Math.round(c[1]);
+  const b = Math.round(c[2]);
+  return a >= 1 ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${a})`;
+}
+
+/** Mix two hex colors straight to a CSS string. */
 export function mixHex(a: string, b: string, t: number): string {
-  const pa = parseInt(a.slice(1), 16);
-  const pb = parseInt(b.slice(1), 16);
-  const ar = (pa >> 16) & 255, ag = (pa >> 8) & 255, ab = pa & 255;
-  const br = (pb >> 16) & 255, bg = (pb >> 8) & 255, bb = pb & 255;
-  const r = Math.round(ar + (br - ar) * t);
-  const g = Math.round(ag + (bg - ag) * t);
-  const bl = Math.round(ab + (bb - ab) * t);
-  return `rgb(${r},${g},${bl})`;
+  return css(mix(rgb(a), rgb(b), t));
 }

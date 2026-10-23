@@ -15,7 +15,7 @@
  *   finish's ink misregistration, and the comic flow caption.
  * - every keystroke ticks the seismograph in the bottom margin.
  */
-import { PALETTES, mixHex, type Palette } from "./palettes";
+import { PALETTES, rgb, mix, css, type Palette, type RGB } from "./palettes";
 import { styleOf, STYLES, type StyleDef } from "./styles";
 import { Spring, landCurve, clamp, lerp, easeOut } from "./springs";
 import { Rhythm } from "./rhythm";
@@ -28,6 +28,8 @@ import {
   savePrefs,
   loadSheet,
   saveSheet,
+  loadUndo,
+  saveUndo,
   type Odometer,
   type Prefs,
   type SavedSheet
@@ -43,6 +45,12 @@ const DRY_MS = 9000;
 const LAND_MS = 110;
 const SEISMO_SPAN = 12000;
 const SAVE_EVERY = 6000;
+/** How long Esc must be held to clear the sheet. A tap does nothing. */
+const ESC_HOLD_MS = 650;
+/** How long a carried word takes to hop down to the next line. */
+const CARRY_MS = 260;
+/** Palette and style changes bloom out from where they were asked for. */
+const BLOOM_MS = 1250;
 
 interface Glyph {
   ch: string;
@@ -55,6 +63,8 @@ interface Glyph {
   stampAt: number | null;
   /** Absolute index of this glyph's event in the session recorder, or -1. */
   echoIdx: number;
+  /** Set when a word wraps: where it was, so it can hop to where it is. */
+  carry: { dx: number; dy: number; at: number } | null;
 }
 
 /** Letterform-shaped shockwave fired by a stamp. */
@@ -75,6 +85,37 @@ interface BakedGlyph {
   w: number;
 }
 
+/** A committed row of the document. */
+interface Line {
+  glyphs: BakedGlyph[];
+  /** Wrapped at the margin: the text continues on the next row, no newline. */
+  soft: boolean;
+}
+
+/** Colors for the current palette and style, resolved once per change. */
+interface Tones {
+  paper: RGB;
+  ink: RGB;
+  sub: RGB;
+  fresh: RGB;
+  misA: RGB;
+  misB: RGB;
+  /** CSS strings for the colors drawn most often. */
+  inkS: string;
+  subS: string;
+  freshS: string;
+  misAS: string;
+  misBS: string;
+}
+
+/** A palette or style change, revealed as ink spreading from a point. */
+interface Bloom {
+  canvas: HTMLCanvasElement;
+  at: number;
+  x: number;
+  y: number;
+  seed: number;
+}
 interface Dying {
   ch: string;
   x: number;
@@ -153,8 +194,11 @@ export class Engine {
   private typingY = 400;
   private maxCols = 60;
 
-  // Text model
-  private baked: BakedGlyph[][] = [];
+  // Text model. `lines` is the whole document; only the rows that fit on
+  // screen are ever drawn.
+  private lines: Line[] = [];
+  /** Logical line number of each row (0 for a wrapped continuation). */
+  private lineNos: number[] = [];
   private active: Glyph[] = [];
   private caretIdx = 0;
   private dying: Dying[] = [];
@@ -168,7 +212,13 @@ export class Engine {
   private captionPunch: Spring;
   private slideFrom = -1e9;
   private wipe: { canvas: HTMLCanvasElement; at: number } | null = null;
+  private bloom: Bloom | null = null;
   private stamps: Stamp[] = [];
+  /** Esc held down: the sheet lifts as you hold, and clears at the top. */
+  private escDownAt: number | null = null;
+  private escLift: Spring;
+  /** A refused keystroke at the margin flashes a silent bell. */
+  private bellAt = -1e9;
 
   // Streaks: consecutive content keys without backspace or a long pause.
   private streak = 0;
@@ -199,6 +249,9 @@ export class Engine {
   private dirtyOdo = false;
   private lastSave = 0;
   private undoSlot: SavedSheet | null = null;
+  private tonesKey = "";
+  private tonesCache: Tones | null = null;
+  private dt = 1 / 60;
 
   // Overlays and chrome
   private helpOpen = false;
@@ -237,18 +290,27 @@ export class Engine {
     this.squash = new Spring(0, 320, 17);
     this.impact = new Spring(0, 380, 26);
     this.captionPunch = new Spring(0, 300, 16);
+    this.escLift = new Spring(0, 260, 22);
     this.bestAtBoot = this.odo.bestWpm;
 
     this.resize();
     window.addEventListener("resize", () => this.resize());
     window.addEventListener("keydown", (e) => this.onKeyDown(e));
     window.addEventListener("keyup", (e) => this.onKeyUp(e));
+    // Keyups never arrive for keys held while focus leaves (Cmd+Tab, a
+    // click into devtools), so let go of everything when it does.
+    window.addEventListener("blur", () => this.releaseAll(performance.now()));
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "hidden") this.persist(true);
+      if (document.visibilityState === "hidden") {
+        this.releaseAll(performance.now());
+        this.persist(true);
+      }
     });
+    window.addEventListener("pagehide", () => this.persist(true));
 
     const saved = loadSheet();
     if (saved) this.restore(saved);
+    this.undoSlot = loadUndo();
     this.caretX.set(this.colX(this.caretIdx));
 
     document.body.style.background = this.palette().paper;
@@ -266,18 +328,34 @@ export class Engine {
   }
 
   /**
-   * Effective accent colors: elemental styles bring their own fresh-ink
-   * colors. On light paper they are pulled toward the palette ink so pale
-   * accents (Frost) stay legible.
+   * Resolved colors for this palette and style. Elemental styles bring
+   * their own fresh-ink colors; on light paper they are pulled toward the
+   * palette ink so pale accents (Frost) stay legible.
    */
-  private fx(p: Palette, sd: StyleDef): { fresh: string; misA: string; misB: string } {
-    if (!sd.accent) return { fresh: p.fresh, misA: p.misA, misB: p.misB };
-    const adapt = (c: string) => (p.dark ? c : mixHex(c, p.ink, 0.32));
-    return {
-      fresh: adapt(sd.accent.fresh),
-      misA: adapt(sd.accent.misA),
-      misB: adapt(sd.accent.misB)
+  private tones(p: Palette, sd: StyleDef): Tones {
+    const key = `${p.id}/${sd.id}`;
+    if (this.tonesCache && this.tonesKey === key) return this.tonesCache;
+    const ink = rgb(p.ink);
+    const adapt = (hex: string): RGB => (p.dark ? rgb(hex) : mix(rgb(hex), ink, 0.32));
+    const fresh = sd.accent ? adapt(sd.accent.fresh) : rgb(p.fresh);
+    const misA = sd.accent ? adapt(sd.accent.misA) : rgb(p.misA);
+    const misB = sd.accent ? adapt(sd.accent.misB) : rgb(p.misB);
+    const sub = rgb(p.sub);
+    this.tonesCache = {
+      paper: rgb(p.paper),
+      ink,
+      sub,
+      fresh,
+      misA,
+      misB,
+      inkS: css(ink),
+      subS: css(sub),
+      freshS: css(fresh),
+      misAS: css(misA),
+      misBS: css(misB)
     };
+    this.tonesKey = key;
+    return this.tonesCache;
   }
 
   private motionMul(): number {
@@ -372,8 +450,11 @@ export class Engine {
 
     switch (key) {
       case "Escape":
+        // Clearing is deliberate: hold Esc and the sheet lifts away. A tap,
+        // the reflex of every vim hand, does nothing to the writing.
         e.preventDefault();
-        this.clearSheet();
+        if (e.repeat) return;
+        if (this.lines.length || this.active.length) this.escDownAt = now;
         return;
       case "Backspace":
         e.preventDefault();
@@ -392,8 +473,9 @@ export class Engine {
         return;
       case "Tab":
         e.preventDefault();
-        this.insertChar(" ", "Space", now);
-        this.insertChar(" ", "Space", now);
+        if (e.repeat) return;
+        this.insertChar(" ", "Tab", now);
+        this.insertChar(" ", "Tab", now);
         return;
       case "ArrowLeft":
         e.preventDefault();
@@ -432,6 +514,10 @@ export class Engine {
     const now = performance.now();
     if (e.key === "Shift") this.shiftHeld = false;
     if (e.key === "Backspace") this.bsHeld = false;
+    if (e.key === "Escape" && this.escDownAt !== null) {
+      if (now - this.escDownAt < 220) this.toast("hold Esc to clear the sheet");
+      this.escDownAt = null;
+    }
     for (let i = 0; i < this.active.length; i++) {
       const g = this.active[i]!;
       if (g.code === e.code && g.upAt === null) {
@@ -460,6 +546,22 @@ export class Engine {
     }
   }
 
+  /**
+   * Let go of every held key at once. Held letters settle at whatever
+   * weight they reached (no stamp: nobody released them on purpose).
+   */
+  private releaseAll(now: number): void {
+    this.bsHeld = false;
+    this.shiftHeld = false;
+    this.escDownAt = null;
+    for (const g of this.active) {
+      if (g.upAt !== null) continue;
+      this.glyphWeight(g, now);
+      g.upAt = now;
+      if (g.echoIdx >= 0) this.recorder.setWeight(g.echoIdx, Math.round(recordWeight(g.peak)));
+    }
+  }
+
   private handleFn(n: number): void {
     switch (n) {
       case 1:
@@ -474,6 +576,7 @@ export class Engine {
         break;
       case 4: {
         const idx = STYLES.findIndex((s) => s.id === this.prefs.style);
+        this.startBloom(this.caretX.x, this.typingY - this.fs * 0.35);
         this.prefs.style = STYLES[(idx + 1) % STYLES.length]!.id;
         this.toast(`Style: ${this.style().label}`);
         this.dotPattern = null;
@@ -514,19 +617,58 @@ export class Engine {
 
   private cyclePalette(dir: number): void {
     const n = PALETTES.length;
-    this.prefs.palette = (this.prefs.palette + dir + n) % n;
+    this.startBloom(this.caretX.x, this.typingY - this.fs * 0.35);
+    this.setPalette((this.prefs.palette + dir + n) % n);
+    this.toast(`Palette: ${this.palette().label}`);
+  }
+
+  private setPalette(idx: number): void {
+    this.prefs.palette = idx;
     document.body.style.background = this.palette().paper;
     this.dotPattern = null;
     this.staticDirty = true;
-    this.toast(`Palette: ${this.palette().label}`);
     savePrefs(this.prefs);
+  }
+
+  /**
+   * Freeze the current frame so the next one can be revealed through it:
+   * the new palette or style spreads out from (x, y) like a drop of ink
+   * on damp paper, with a darker tide line at its edge.
+   */
+  private startBloom(x: number, y: number): void {
+    const prev = this.bloom?.canvas;
+    const snap = prev && prev.width === this.canvas.width && prev.height === this.canvas.height
+      ? prev
+      : document.createElement("canvas");
+    snap.width = this.canvas.width;
+    snap.height = this.canvas.height;
+    const sc = snap.getContext("2d");
+    if (!sc) return;
+    sc.drawImage(this.canvas, 0, 0);
+    this.bloom = { canvas: snap, at: performance.now(), x, y, seed: Math.random() * 1000 };
   }
 
   // ------------------------------------------------------------- edits
 
   private insertChar(ch: string, code: string, now: number): void {
-    if (ch === " ") this.checkSecretWord(now);
-    if (this.active.length >= this.maxCols) this.commitLine(now);
+    if (this.active.length >= this.maxCols) {
+      // The margin. Mid-line there is nowhere for the overflow to go, so
+      // the bell rings (silently) and the key is refused, like a carriage
+      // at its stop. At the end of the line the text wraps, carrying any
+      // unfinished word down with it.
+      if (this.caretIdx < this.active.length) {
+        this.bellAt = now;
+        this.squash.kick(-1.6 * this.motionMul());
+        return;
+      }
+      this.wrapLine(ch, now);
+      if (ch === " ") {
+        this.hasTyped = true;
+        this.lastInput = now;
+        this.bumpStreak(now);
+        return;
+      }
+    }
     const g: Glyph = {
       ch,
       born: now,
@@ -535,7 +677,8 @@ export class Engine {
       cap: ch >= "A" && ch <= "Z",
       peak: BASE_W,
       stampAt: null,
-      echoIdx: this.recorder.note(ch, now)
+      echoIdx: this.recorder.note(ch, now),
+      carry: null
     };
     this.active.splice(this.caretIdx, 0, g);
     this.caretIdx += 1;
@@ -556,6 +699,49 @@ export class Engine {
     }
     this.spawnFor(this.colX(this.caretIdx - 1), this.typingY - this.fs * 0.35, now, 1);
     this.dirtySheet = true;
+  }
+
+  /**
+   * Soft wrap at the margin. A space typed at the margin ends the row (and
+   * stays on it, invisible, so copied text keeps it). Otherwise the word in
+   * progress hops down to the new row; a single word wider than the whole
+   * measure has nowhere to hop and breaks where it is.
+   */
+  private wrapLine(ch: string, now: number): void {
+    let keep = this.active.length;
+    if (ch !== " ") {
+      const sp = this.active.map((g) => g.ch).lastIndexOf(" ");
+      if (sp >= 0) keep = sp + 1;
+    }
+    const carried = this.active.slice(keep);
+    this.active = this.active.slice(0, keep);
+    if (ch === " ") {
+      this.active.push({
+        ch,
+        born: now,
+        upAt: now,
+        code: "",
+        cap: false,
+        peak: BASE_W,
+        stampAt: null,
+        echoIdx: this.recorder.note(ch, now),
+        carry: null
+      });
+      this.rhythm.record(now);
+    }
+    this.bakeActive(true, now);
+    const mm = this.motionMul();
+    carried.forEach((g, j) => {
+      g.carry = mm > 0 ? { dx: keep * this.advance, dy: 0, at: now + j * 14 } : null;
+    });
+    this.active = carried;
+    this.caretIdx = carried.length;
+    this.caretX.set(this.colX(carried.length));
+    // The carriage returns: the caret sweeps back from the margin.
+    if (mm > 0) {
+      this.caretX.x = this.colX(this.maxCols);
+      this.caretX.v = -2400 * mm;
+    }
   }
 
   /** Streak bookkeeping plus milestone celebrations. */
@@ -592,50 +778,48 @@ export class Engine {
       this.impact.kick(-14 * this.motionMul());
       this.lastInput = now;
       this.dirtySheet = true;
-    } else if (this.baked.length > 0) {
+    } else if (this.lines.length > 0) {
       this.unEnter(now);
     } else {
       this.squash.kick(-1.2 * this.motionMul());
     }
   }
 
-  private commitLine(now: number): void {
-    this.checkSecretWord(now);
-    this.recorder.note("\n", now);
-    const line: BakedGlyph[] = this.active.map((g) => ({
-      ch: g.ch,
-      w: Math.round(recordWeight(g.peak))
-    }));
-    this.baked.push(line);
-    const keep = Math.ceil(this.typingY / this.lineHeight) + 4;
-    if (this.baked.length > keep) this.baked.splice(0, this.baked.length - keep);
+  /** Move the active row into the document and start a fresh one. */
+  private bakeActive(soft: boolean, now: number): void {
+    this.lines.push({
+      glyphs: this.active.map((g) => ({ ch: g.ch, w: Math.round(recordWeight(g.peak)) })),
+      soft
+    });
     this.active = [];
     this.caretIdx = 0;
     this.slideFrom = now;
     this.staticDirty = true;
+    this.dirtySheet = true;
+  }
+
+  private commitLine(now: number): void {
+    if (this.secretLine(now)) return;
+    this.recorder.note("\n", now);
+    this.bakeActive(false, now);
     this.squash.kick(4.2 * this.motionMul());
     this.impact.kick(85 * this.motionMul());
     this.bumpStreak(now);
     this.spawnFor(this.caretX.x, this.typingY - this.fs * 0.35, now, 2);
-    this.dirtySheet = true;
   }
 
   /**
-   * The page listens for words. Typing a style's name (or its element:
-   * fire, water, ice, wind) switches to it mid-sentence; palettes answer
-   * to their names; "zen" hides all chrome. Checked at word boundaries
-   * (space or Enter), reading the letters just behind the caret.
+   * The page listens for words, but only when you clearly mean it: a
+   * style's name (or its element: fire, water, ice, wind), a palette's
+   * name, or "zen", written alone on its line and sent with Enter. Prose
+   * that merely mentions water stays prose. The word is spent: it stamps
+   * itself into the page and the change blooms out from where it stood.
    */
-  private checkSecretWord(now: number): void {
-    let word = "";
-    for (let i = this.caretIdx - 1; i >= 0 && word.length < 12; i--) {
-      const c = this.active[i]!.ch;
-      if (!/[a-zA-Z]/.test(c)) break;
-      word = c.toLowerCase() + word;
-    }
-    if (word.length < 3) return;
+  private secretLine(now: number): boolean {
+    const word = this.active.map((g) => g.ch).join("").trim().toLowerCase();
+    if (word.length < 3 || word.length > 12 || !/^[a-z]+$/.test(word)) return false;
 
-    const styleAlias: Record<string, string> = {
+    const styleAlias: Record<string, Prefs["style"]> = {
       fire: "ember",
       ember: "ember",
       water: "tide",
@@ -649,30 +833,40 @@ export class Engine {
       plain: "clean",
       clean: "clean"
     };
-
     const styleId = styleAlias[word];
-    if (styleId && styleId !== this.prefs.style) {
-      this.prefs.style = styleId as Prefs["style"];
-      this.dotPattern = null;
-      this.staticDirty = true;
-      this.toast(`You typed it. Style: ${this.style().label}`);
-      this.impact.kick(60 * this.motionMul());
-      savePrefs(this.prefs);
-      return;
-    }
-
     const palIdx = PALETTES.findIndex((p) => p.id === word);
-    if (palIdx >= 0 && palIdx !== this.prefs.palette) {
-      this.prefs.palette = palIdx;
-      document.body.style.background = this.palette().paper;
+    if (!styleId && palIdx < 0 && word !== "zen") return false;
+
+    // Where the word sits on the line: the bloom starts at its middle.
+    let first = this.active.findIndex((g) => g.ch !== " ");
+    if (first < 0) first = 0;
+    const mid = this.colX(first) + (word.length * this.advance) / 2;
+    const cy = this.typingY - this.fs * 0.35;
+    this.startBloom(mid, cy);
+    if (this.motionMul() > 0) {
+      for (let i = 0; i < this.active.length; i++) {
+        const g = this.active[i]!;
+        if (g.ch === " ") continue;
+        this.stamps.push({ ch: g.ch, x: this.colX(i), w: this.glyphWeight(g, now) + 120, at: now + i * 28, power: 1 });
+      }
+      if (this.stamps.length > 24) this.stamps.splice(0, this.stamps.length - 24);
+    }
+    this.active = [];
+    this.caretIdx = 0;
+    this.dirtySheet = true;
+    this.impact.kick(70 * this.motionMul());
+    this.squash.kick(4 * this.motionMul());
+
+    if (styleId) {
+      this.prefs.style = styleId;
       this.dotPattern = null;
       this.staticDirty = true;
-      this.toast(`You typed it. Palette: ${this.palette().label}`);
+      this.toast(`you typed it. style: ${this.style().label.toLowerCase()}`);
       savePrefs(this.prefs);
-      return;
-    }
-
-    if (word === "zen") {
+    } else if (palIdx >= 0) {
+      this.setPalette(palIdx);
+      this.toast(`you typed it. palette: ${this.palette().label.toLowerCase()}`);
+    } else {
       const anyOn = this.prefs.chrome || this.prefs.seismo || this.prefs.caption;
       this.prefs.chrome = !anyOn;
       this.prefs.seismo = !anyOn;
@@ -680,12 +874,22 @@ export class Engine {
       this.toast(anyOn ? "zen" : "welcome back");
       savePrefs(this.prefs);
     }
-    void now;
+    return true;
   }
 
+  /**
+   * Backspace at the start of a row pulls the row above back down. If the
+   * two would not fit on one row together, the bell rings instead.
+   */
   private unEnter(now: number): void {
-    const line = this.baked.pop()!;
-    this.active = line.map((bg) => ({
+    const prev = this.lines[this.lines.length - 1]!;
+    if (this.active.length > 0 && prev.glyphs.length + this.active.length > this.maxCols) {
+      this.bellAt = now;
+      this.squash.kick(-1.6 * this.motionMul());
+      return;
+    }
+    this.lines.pop();
+    const back: Glyph[] = prev.glyphs.map((bg) => ({
       ch: bg.ch,
       born: now - 60000,
       upAt: now - 60000,
@@ -693,9 +897,11 @@ export class Engine {
       cap: false,
       peak: peakFromRecord(bg.w),
       stampAt: null,
-      echoIdx: -1
+      echoIdx: -1,
+      carry: null
     }));
-    this.caretIdx = this.active.length;
+    this.active = back.concat(this.active);
+    this.caretIdx = back.length;
     this.caretX.set(this.colX(this.caretIdx));
     this.staticDirty = true;
     this.lastInput = now;
@@ -703,8 +909,9 @@ export class Engine {
   }
 
   private clearSheet(): void {
-    if (this.baked.length === 0 && this.active.length === 0) return;
+    if (this.lines.length === 0 && this.active.length === 0) return;
     this.undoSlot = this.serialize();
+    saveUndo(this.undoSlot);
 
     const snap = document.createElement("canvas");
     snap.width = this.canvas.width;
@@ -713,39 +920,57 @@ export class Engine {
     if (sc) sc.drawImage(this.canvas, 0, 0);
     this.wipe = { canvas: snap, at: performance.now() };
 
-    this.baked = [];
+    this.lines = [];
     this.active = [];
     this.caretIdx = 0;
     this.staticDirty = true;
     this.dirtySheet = true;
-    this.toast("Cleared. Ctrl+Z restores");
+    this.persist(true);
+    this.toast("cleared. Ctrl+Z brings it back");
   }
 
+  /**
+   * Bring back the last cleared sheet. Whatever is on the page now trades
+   * places with it, so a second Ctrl+Z undoes the undo and nothing is ever
+   * lost to it.
+   */
   private undoClear(): void {
     if (!this.undoSlot) return;
+    const current = this.lines.length || this.active.length ? this.serialize() : null;
     this.restore(this.undoSlot);
-    this.undoSlot = null;
+    this.undoSlot = current;
+    saveUndo(current);
+    this.caretX.set(this.colX(this.caretIdx));
     this.staticDirty = true;
     this.dirtySheet = true;
-    this.toast("Restored");
+    this.persist(true);
+    this.toast("restored");
+  }
+
+  /** The whole document as plain text. Wrapped rows rejoin. */
+  private text(): string {
+    let out = "";
+    for (const l of this.lines) {
+      for (const g of l.glyphs) out += g.ch;
+      if (!l.soft) out += "\n";
+    }
+    for (const g of this.active) out += g.ch;
+    return out;
   }
 
   private copyAll(): void {
-    const text =
-      this.baked.map((l) => l.map((g) => g.ch).join("")).join("\n") +
-      (this.baked.length ? "\n" : "") +
-      this.active.map((g) => g.ch).join("");
+    const text = this.text();
     if (!text.trim()) return;
     navigator.clipboard
       .writeText(text)
-      .then(() => this.toast("Copied to clipboard"))
-      .catch(() => this.toast("Copy failed"));
+      .then(() => this.toast("copied, all of it"))
+      .catch(() => this.toast("copy failed"));
   }
 
   private serialize(): SavedSheet {
     const now = performance.now();
     return {
-      lines: this.baked.map((l) => l.map((g) => ({ ch: g.ch, w: g.w }))),
+      lines: this.lines.map((l) => ({ glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })), soft: l.soft })),
       active: this.active.map((g) => ({
         ch: g.ch,
         w: Math.round(recordWeight(g.upAt === null ? this.glyphWeight(g, now) : g.peak))
@@ -755,7 +980,7 @@ export class Engine {
 
   private restore(s: SavedSheet): void {
     const now = performance.now();
-    this.baked = s.lines.map((l) => l.map((g) => ({ ch: g.ch, w: g.w })));
+    this.lines = s.lines.map((l) => ({ glyphs: l.glyphs.map((g) => ({ ch: g.ch, w: g.w })), soft: l.soft }));
     this.active = s.active.map((g) => ({
       ch: g.ch,
       born: now - 60000,
@@ -764,9 +989,41 @@ export class Engine {
       cap: false,
       peak: peakFromRecord(g.w),
       stampAt: null,
-      echoIdx: -1
+      echoIdx: -1,
+      carry: null
     }));
     this.caretIdx = this.active.length;
+  }
+
+  /** Read-only state for the end-to-end tests (enabled with ?probe). */
+  probe(): {
+    text: string;
+    rows: string[];
+    active: string;
+    activeLineNo: number;
+    lineNos: number[];
+    prefs: Prefs;
+    layout: { marginX: number; typingY: number; advance: number; fs: number; lineHeight: number; maxCols: number };
+    canUndo: boolean;
+  } {
+    if (this.staticDirty) this.renumber();
+    return {
+      text: this.text(),
+      rows: this.lines.map((l) => l.glyphs.map((g) => g.ch).join("")),
+      active: this.active.map((g) => g.ch).join(""),
+      activeLineNo: this.activeLineNo(),
+      lineNos: this.lineNos.slice(),
+      prefs: { ...this.prefs },
+      layout: {
+        marginX: this.marginX,
+        typingY: this.typingY,
+        advance: this.advance,
+        fs: this.fs,
+        lineHeight: this.lineHeight,
+        maxCols: this.maxCols
+      },
+      canUndo: this.undoSlot !== null
+    };
   }
 
   private persist(force: boolean): void {
@@ -814,6 +1071,7 @@ export class Engine {
   private frame(t: number): void {
     const dt = clamp((t - this.prev) / 1000, 0, 0.04);
     this.prev = t;
+    this.dt = dt;
 
     // Signals
     const flow = this.rhythm.flow(t);
@@ -841,6 +1099,21 @@ export class Engine {
         }
       }
     }
+
+    // Esc held long enough: the lifted sheet lets go.
+    let escT = 0;
+    if (this.escDownAt !== null) {
+      escT = (t - this.escDownAt) / ESC_HOLD_MS;
+      if (escT >= 1) {
+        this.escDownAt = null;
+        escT = 0;
+        this.clearSheet();
+        this.escLift.set(0);
+      }
+    }
+    this.escLift.target = escT;
+    if (escT > 0) this.escLift.set(escT);
+    else this.escLift.update(dt);
 
     this.caretX.target = this.colX(this.caretIdx);
     this.caretX.update(dt);
@@ -875,11 +1148,17 @@ export class Engine {
   private draw(now: number): void {
     const p = this.palette();
     const sd = this.style();
-    const fx = this.fx(p, sd);
+    const fx = this.tones(p, sd);
     const ctx = this.ctx;
     const mm = this.motionMul();
 
+    // Every frame starts from a known canvas state. Nothing drawn last
+    // frame (a stray shadow, a dangling alpha) can leak into this one.
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.shadowBlur = 0;
+    ctx.shadowColor = "rgba(0,0,0,0)";
     ctx.fillStyle = p.paper;
     ctx.fillRect(0, 0, this.w, this.h);
 
@@ -891,51 +1170,105 @@ export class Engine {
 
     // The writing surface: a faint full-height ruled sheet the text sits on,
     // brightest at the active line. Drawn under all ink.
-    this.drawRules(p, fx, now, mm);
+    this.drawRules(fx, now, mm);
+
+    // Holding Esc lifts the writing off the page: it rises and thins out
+    // as the hold goes on, and drops back if you let go early.
+    const lift = clamp(this.escLift.x, -0.2, 1);
+    const liftY = -lift * this.lineHeight * 0.35 * Math.max(mm, 0.3);
+    this.inkAlpha = 1 - clamp(lift, 0, 1) * 0.72;
 
     // Settled history (static layer), with the Enter slide.
-    if (this.staticDirty) this.rebuildStatic(p, now);
+    if (this.staticDirty) this.rebuildStatic(p);
     const slideT = clamp((now - this.slideFrom) / 170, 0, 1);
     const slide = (1 - easeOut(slideT)) * this.lineHeight * mm;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.drawImage(this.staticCanvas, 0, (slide + pageY) * this.dpr);
+    ctx.globalAlpha = this.inkAlpha;
+    ctx.drawImage(this.staticCanvas, 0, (slide + pageY + liftY) * this.dpr);
     ctx.restore();
 
     this.drawRipples(fx, now, mm);
     this.drawParticles(fx, now);
-    this.drawActiveLine(p, sd, fx, now, mm);
+    ctx.translate(0, liftY);
+    this.drawActiveLine(sd, fx, now, mm);
+    ctx.translate(0, -liftY);
+    this.inkAlpha = 1;
     this.drawStamps(fx, now, mm);
-    this.drawDying(p, now);
-    this.drawCaret(p, sd, fx, now, mm);
+    this.drawDying(fx, now);
+    this.drawCaret(sd, fx, now, mm);
+    if (lift > 0.001) this.drawEscHold(fx, lift);
+    this.drawBell(fx, now, mm);
     if (this.prefs.seismo) this.drawSeismo(p, fx, now);
     this.drawCaption(p, sd, fx, now);
     if (this.prefs.chrome) this.drawChrome(p, sd, now);
     this.drawWelcome(p, now);
     this.drawToast(p, now);
 
+    if (this.bloom) this.drawBloom(fx, now, mm);
     if (this.wipe) this.drawWipe(now, mm);
     if (this.helpOpen) this.drawHelp(p, sd);
     if (this.statsOpen) this.drawStats(p);
   }
 
-  private rebuildStatic(p: Palette, now: number): void {
+  /** Recompute logical line numbers (wrapped rows continue a number). */
+  private renumber(): void {
+    const nos = new Array<number>(this.lines.length);
+    let n = 0;
+    let continuing = false;
+    for (let i = 0; i < this.lines.length; i++) {
+      nos[i] = continuing ? 0 : ++n;
+      continuing = this.lines[i]!.soft;
+    }
+    this.lineNos = nos;
+  }
+
+  private activeLineNo(): number {
+    const last = this.lines[this.lines.length - 1];
+    if (last?.soft) return 0;
+    let n = 0;
+    for (const no of this.lineNos) if (no > n) n = no;
+    return n + 1;
+  }
+
+  /**
+   * Only the rows that can be seen are drawn. Old ink fades as it climbs,
+   * and is gone entirely before it reaches the controls and the sticker at
+   * the top, so history never prints over them.
+   */
+  private rebuildStatic(p: Palette): void {
+    this.renumber();
     const s = this.staticCtx;
     s.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    s.globalCompositeOperation = "source-over";
     s.clearRect(0, 0, this.w, this.h);
     s.textBaseline = "alphabetic";
-    const n = this.baked.length;
-    for (let i = 0; i < n; i++) {
-      const rowFromActive = n - i;
-      const y = this.typingY - this.lineHeight * rowFromActive;
-      if (y < -this.lineHeight) continue;
-      const fade = clamp(1 - (rowFromActive - 3) * 0.045, 0.3, 1);
-      s.globalAlpha = fade;
-      this.drawBakedLine(s, this.baked[i]!, y, p.ink);
+    const n = this.lines.length;
+    const { clearTop, fadeTop } = this.historyFade();
+    for (let row = 1; row <= n; row++) {
+      const y = this.typingY - this.lineHeight * row;
+      if (y < clearTop) break;
+      s.globalAlpha = clamp(1 - (row - 2) * 0.06, 0.35, 1);
+      this.drawBakedLine(s, this.lines[n - row]!.glyphs, y, p.ink);
     }
     s.globalAlpha = 1;
+    // Dissolve the top of the history into the paper.
+    s.globalCompositeOperation = "destination-out";
+    const grad = s.createLinearGradient(0, clearTop, 0, fadeTop);
+    grad.addColorStop(0, "rgba(0,0,0,1)");
+    grad.addColorStop(1, "rgba(0,0,0,0)");
+    s.fillStyle = grad;
+    s.fillRect(0, 0, this.w, fadeTop);
+    s.globalCompositeOperation = "source-over";
     this.staticDirty = false;
-    void now;
+  }
+
+  /** Where history must be gone by (clearTop) and starts to fade (fadeTop). */
+  private historyFade(): { clearTop: number; fadeTop: number } {
+    const clearTop = Math.max(this.prefs.chrome || this.prefs.caption ? 96 : 40, this.fs * 2.4);
+    const room = this.typingY - this.lineHeight - clearTop;
+    const fadeTop = clearTop + clamp(room * 0.45, 0, this.lineHeight * 3.5);
+    return { clearTop, fadeTop };
   }
 
   /** Draw a baked line, batching runs of equal weight into single fillText calls. */
@@ -959,10 +1292,12 @@ export class Engine {
     }
   }
 
+  /** Multiplier on the active row's ink, lowered while Esc lifts the sheet. */
+  private inkAlpha = 1;
+
   private drawActiveLine(
-    p: Palette,
     sd: StyleDef,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -973,12 +1308,23 @@ export class Engine {
       const age = now - g.born;
       const land = mm > 0 ? landCurve(age / LAND_MS) : 1;
       const settling = land < 0.999 || age < 600;
-      const alpha = Math.min(1, age / 45);
+      const alpha = Math.min(1, age / 45) * this.inkAlpha;
       const weight = this.glyphWeight(g, now);
       const dryT = g.upAt === null ? 0 : Math.min(1, (now - g.upAt) / DRY_MS);
-      const x = this.colX(i);
+      let x = this.colX(i);
       let y = this.typingY;
       let xOff = 0;
+
+      // A word carried down by the wrap hops from where it was.
+      if (g.carry) {
+        const ct = (now - g.carry.at) / CARRY_MS;
+        if (ct >= 1) g.carry = null;
+        else {
+          const e = ct <= 0 ? 0 : easeOut(ct);
+          x += g.carry.dx * (1 - e);
+          y += g.carry.dy * (1 - e) - Math.sin(Math.PI * clamp(ct, 0, 1)) * this.fs * 0.45 * mm;
+        }
+      }
 
       // How this style's glyphs arrive.
       if (settling && mm > 0) {
@@ -1011,15 +1357,15 @@ export class Engine {
         const mis = this.heat * 2.8 * mm * (1 - Math.min(1, age / 600));
         if (mis > 0.35) {
           ctx.globalAlpha = alpha * 0.55;
-          ctx.fillStyle = fx.misA;
+          ctx.fillStyle = fx.misAS;
           ctx.fillText(g.ch, x - mis, y + mis * 0.4);
-          ctx.fillStyle = fx.misB;
+          ctx.fillStyle = fx.misBS;
           ctx.fillText(g.ch, x + mis, y - mis * 0.3);
         }
       }
 
       ctx.globalAlpha = alpha;
-      ctx.fillStyle = dryT >= 1 ? p.ink : mixHex(fx.fresh, p.ink, dryT);
+      ctx.fillStyle = dryT >= 1 ? fx.inkS : css(mix(fx.fresh, fx.ink, dryT));
 
       // A freshly stamped letter pulses down into the page.
       let stampScale = 1;
@@ -1032,8 +1378,7 @@ export class Engine {
       const glowing =
         sd.glow > 1 && mm > 0 && dryT < 0.5 && this.heat > 0.08 && age < 1500;
       if (glowing) {
-        ctx.save();
-        ctx.shadowColor = fx.fresh;
+        ctx.shadowColor = fx.freshS;
         ctx.shadowBlur = (1 - dryT) * 9 * this.heat * sd.glow * mm;
       }
 
@@ -1068,18 +1413,19 @@ export class Engine {
       } else {
         ctx.fillText(g.ch, x + xOff, y);
       }
+      if (glowing) ctx.shadowBlur = 0;
     }
     ctx.globalAlpha = 1;
   }
 
-  private drawDying(p: Palette, now: number): void {
+  private drawDying(fx: Tones, now: number): void {
     const ctx = this.ctx;
     this.dying = this.dying.filter((d) => now - d.at < 95);
     for (const d of this.dying) {
       const t = (now - d.at) / 95;
       ctx.globalAlpha = (1 - t) * 0.8;
       ctx.font = this.font(d.w);
-      ctx.fillStyle = p.fresh;
+      ctx.fillStyle = fx.freshS;
       ctx.fillText(d.ch, d.x + t * this.advance * 0.35, this.typingY + t * 3);
     }
     ctx.globalAlpha = 1;
@@ -1091,7 +1437,7 @@ export class Engine {
    * the hero even at maximum impact.
    */
   private drawStamps(
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1100,10 +1446,11 @@ export class Engine {
     this.stamps = this.stamps.filter((s) => now - s.at < 340);
     for (const s of this.stamps) {
       const t = (now - s.at) / 340;
+      if (t < 0) continue;
       const sc = 1 + (0.7 + s.power * 0.9) * easeOut(t) * mm;
       ctx.globalAlpha = (1 - t) * (0.3 + s.power * 0.25);
       ctx.font = this.font(s.w);
-      ctx.strokeStyle = fx.fresh;
+      ctx.strokeStyle = fx.freshS;
       ctx.lineWidth = 1.1;
       ctx.save();
       ctx.translate(s.x + this.advance / 2, this.typingY - this.fs * 0.33);
@@ -1200,7 +1547,7 @@ export class Engine {
   }
 
   private drawParticles(
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number
   ): void {
     if (this.particles.length === 0) return;
@@ -1215,7 +1562,7 @@ export class Engine {
           const x = pt.x0 + pt.vx * s + Math.sin(pt.seed * 9 + age / 160) * 3;
           const y = pt.y0 + pt.vy * s - 26 * s * s;
           ctx.globalAlpha = (1 - t) * 0.85;
-          ctx.fillStyle = t < 0.35 ? fx.misA : fx.fresh;
+          ctx.fillStyle = t < 0.35 ? fx.misAS : fx.freshS;
           ctx.beginPath();
           ctx.arc(x, y, Math.max(0.6, 2.2 * (1 - t * 0.6)), 0, Math.PI * 2);
           ctx.fill();
@@ -1224,7 +1571,7 @@ export class Engine {
         case "ring": {
           const r = 3 + 17 * easeOut(t);
           ctx.globalAlpha = (1 - t) * 0.45;
-          ctx.strokeStyle = fx.fresh;
+          ctx.strokeStyle = fx.freshS;
           ctx.lineWidth = 1.2;
           ctx.beginPath();
           ctx.ellipse(pt.x0, pt.y0, r, r * 0.34, 0, 0, Math.PI * 2);
@@ -1236,7 +1583,7 @@ export class Engine {
           const y = pt.y0 + pt.vy * s;
           const tw = 0.5 + 0.5 * Math.sin(age / 90 + pt.seed * 9);
           ctx.globalAlpha = (1 - t) * tw * 0.9;
-          ctx.fillStyle = fx.misA;
+          ctx.fillStyle = fx.misAS;
           ctx.save();
           ctx.translate(x, y);
           ctx.rotate(Math.PI / 4);
@@ -1248,7 +1595,7 @@ export class Engine {
           const x = pt.x0 + pt.vx * s;
           const y = pt.y0 + Math.sin(age / 230 + pt.seed * 7) * 6 + 12 * s;
           ctx.globalAlpha = (1 - t) * 0.65;
-          ctx.fillStyle = fx.fresh;
+          ctx.fillStyle = fx.freshS;
           ctx.beginPath();
           ctx.ellipse(x, y, 2.6, 1.1, pt.seed * 3 + age / 500, 0, Math.PI * 2);
           ctx.fill();
@@ -1265,7 +1612,7 @@ export class Engine {
    * feels alive. Short and low-contrast so it reads as feedback, not noise.
    */
   private drawRipples(
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1276,23 +1623,13 @@ export class Engine {
       const t = (now - r.at) / 300;
       const rad = (5 + 24 * easeOut(t)) * (0.7 + r.power * 0.5);
       ctx.globalAlpha = (1 - t) * 0.3 * r.power * mm;
-      ctx.strokeStyle = fx.fresh;
+      ctx.strokeStyle = fx.freshS;
       ctx.lineWidth = 1.6 * (1 - t) + 0.4;
       ctx.beginPath();
       ctx.arc(r.x, r.y, rad, 0, Math.PI * 2);
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-  }
-
-  private withAlpha(color: string, a: number): string {
-    if (color[0] === "#") {
-      const v = parseInt(color.slice(1), 16);
-      return `rgba(${(v >> 16) & 255},${(v >> 8) & 255},${v & 255},${a})`;
-    }
-    const m = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/.exec(color);
-    if (m) return `rgba(${m[1]},${m[2]},${m[3]},${a})`;
-    return color;
   }
 
   /**
@@ -1304,8 +1641,7 @@ export class Engine {
    * margin, marking the lines you have actually written.
    */
   private drawRules(
-    p: Palette,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1318,6 +1654,10 @@ export class Engine {
     const numX = this.marginX - this.fs * 0.5;
     const small = Math.round(this.fs * 0.42);
     const flash = clamp(1 - (now - this.lastInput) / 160, 0, 1);
+    const horizon = css(mix(fx.sub, fx.fresh, 0.5));
+    if (this.staticDirty) this.renumber();
+    const activeNo = this.activeLineNo();
+    const { clearTop } = this.historyFade();
 
     ctx.textBaseline = "alphabetic";
     // Iterate every line slot on screen; i is offset in lines from the
@@ -1333,7 +1673,7 @@ export class Engine {
       const baseA = active
         ? 0.34 + this.heat * 0.14 + flash * 0.18
         : clamp(0.12 - dist * 0.012, 0.03, 0.12);
-      ctx.strokeStyle = active ? mixHex(p.sub, p.fresh, 0.5) : p.sub;
+      ctx.strokeStyle = active ? horizon : fx.subS;
       ctx.globalAlpha = baseA;
       ctx.lineWidth = active ? 1.4 : 1;
       ctx.beginPath();
@@ -1341,16 +1681,21 @@ export class Engine {
       ctx.lineTo(right, Math.round(y) + 0.5);
       ctx.stroke();
 
-      // Line number, only for lines that have been written (active + history).
-      const lineNo = this.baked.length + 1 + i; // i<0 are earlier committed lines
-      if (lineNo >= 1 && i <= 0) {
-        const numA = active ? 0.4 : clamp(0.18 - dist * 0.02, 0.05, 0.18);
-        ctx.globalAlpha = numA;
-        ctx.fillStyle = active ? mixHex(p.sub, p.fresh, 0.5) : p.sub;
-        ctx.font = this.font(active ? 560 : 440, small);
-        const label = String(lineNo);
-        const tw = ctx.measureText(label).width;
-        ctx.fillText(label, numX - tw, y - this.fs * 0.2);
+      // Line numbers for the rows that have been written. A row that
+      // continues a wrapped line gets a quiet tick instead of a number.
+      const row = this.lines.length + i; // index into lines; == length is active
+      if (i <= 0 && row >= 0 && y - this.fs * 0.2 > clearTop) {
+        const no = active ? activeNo : this.lineNos[row]!;
+        ctx.globalAlpha = active ? 0.4 : clamp(0.18 - dist * 0.02, 0.05, 0.18);
+        ctx.fillStyle = active ? horizon : fx.subS;
+        if (no > 0) {
+          ctx.font = this.font(active ? 560 : 440, small);
+          const label = String(no);
+          const tw = ctx.measureText(label).width;
+          ctx.fillText(label, numX - tw, y - this.fs * 0.2);
+        } else {
+          ctx.fillRect(numX - small * 0.55, y - this.fs * 0.2 - small * 0.32, small * 0.4, 1.5);
+        }
       }
     }
 
@@ -1362,8 +1707,8 @@ export class Engine {
         const cx = clamp(this.caretX.x, left, right);
         const r = this.fs * (2.4 + this.heat * 2);
         const grad = ctx.createRadialGradient(cx, ruleY, 0, cx, ruleY, r);
-        grad.addColorStop(0, this.withAlpha(fx.fresh, glow * 0.6));
-        grad.addColorStop(1, this.withAlpha(fx.fresh, 0));
+        grad.addColorStop(0, css(fx.fresh, glow * 0.6));
+        grad.addColorStop(1, css(fx.fresh, 0));
         ctx.fillStyle = grad;
         ctx.fillRect(cx - r, ruleY - this.fs * 0.5, r * 2, this.fs);
       }
@@ -1377,9 +1722,8 @@ export class Engine {
    * backspace. The one element that is never still.
    */
   private drawCaret(
-    p: Palette,
     sd: StyleDef,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number,
     mm: number
   ): void {
@@ -1401,21 +1745,21 @@ export class Engine {
     const flash = clamp(1 - (now - this.lastInput) / 140, 0, 1);
     const glow = (18 * this.heat + 12 * flash) * sd.glow * mm;
     if (glow > 0.5 && mm > 0) {
-      ctx.shadowColor = fx.fresh;
+      ctx.shadowColor = fx.freshS;
       ctx.shadowBlur = glow;
     }
     // Speed smear: ghost carets trail behind fast movement.
     if (Math.abs(this.caretX.v) > 600 && mm > 0) {
       const smear = clamp(this.caretX.v * 0.014, -this.advance * 2, this.advance * 2);
       ctx.globalAlpha = blink * 0.14;
-      ctx.fillStyle = fx.fresh;
+      ctx.fillStyle = fx.freshS;
       ctx.fillRect(-smear, -chh, cw, chh);
       ctx.globalAlpha = blink * 0.07;
       ctx.fillRect(-smear * 1.8, -chh, cw, chh);
     }
     ctx.globalAlpha = blink;
     // A keystroke briefly tints the caret toward the fresh accent.
-    ctx.fillStyle = this.shiftHeld ? fx.fresh : flash > 0.05 ? mixHex(p.ink, p.fresh, flash * 0.6) : p.ink;
+    ctx.fillStyle = this.shiftHeld ? fx.freshS : flash > 0.05 ? css(mix(fx.ink, fx.fresh, flash * 0.6)) : fx.inkS;
     ctx.fillRect(0, -chh, cw, chh);
     ctx.restore();
     ctx.globalAlpha = 1;
@@ -1423,7 +1767,7 @@ export class Engine {
 
   private drawSeismo(
     p: Palette,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number
   ): void {
     const ctx = this.ctx;
@@ -1443,7 +1787,7 @@ export class Engine {
     // Milestone flash: the whole baseline lights up for a beat.
     const flashT = (now - this.seismoFlashAt) / 450;
     if (flashT < 1) {
-      ctx.strokeStyle = fx.fresh;
+      ctx.strokeStyle = fx.freshS;
       ctx.globalAlpha = (1 - flashT) * 0.85;
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -1461,7 +1805,7 @@ export class Engine {
       const gap = i > 0 ? t - ticks[i - 1]! : 400;
       const hgt = clamp(1400 / Math.max(gap, 40), 3, 18);
       const recent = clamp(1 - (now - t) / SEISMO_SPAN, 0, 1);
-      ctx.strokeStyle = this.heat > 0.2 && now - t < 1500 ? fx.fresh : p.sub;
+      ctx.strokeStyle = this.heat > 0.2 && now - t < 1500 ? fx.freshS : p.sub;
       ctx.globalAlpha = 0.25 + 0.55 * recent;
       ctx.beginPath();
       ctx.moveTo(x, yMid - hgt);
@@ -1476,7 +1820,7 @@ export class Engine {
   private drawCaption(
     p: Palette,
     sd: StyleDef,
-    fx: { fresh: string; misA: string; misB: string },
+    fx: Tones,
     now: number
   ): void {
     const override = this.captionOverride && now < this.captionOverride.until
@@ -1486,7 +1830,7 @@ export class Engine {
     const flowOn =
       override !== null ||
       (this.prefs.caption && this.heat > 0.12 && this.emaWpm > 38 && now - this.lastInput < 900);
-    this.captionA += ((flowOn ? 1 : 0) - this.captionA) * 0.12;
+    this.captionA += ((flowOn ? 1 : 0) - this.captionA) * (1 - Math.exp(-this.dt * 7.5));
     if (this.captionA < 0.02) return;
     const print = sd.id === "print";
     void fx;
@@ -1544,7 +1888,7 @@ export class Engine {
    * typed; fades from view forever the moment there is text.
    */
   private drawWelcome(p: Palette, now: number): void {
-    if (this.hasTyped || this.baked.length || this.active.length) return;
+    if (this.hasTyped || this.lines.length || this.active.length) return;
     if (this.helpOpen || this.statsOpen) return;
     if (now - this.bootAt < 600) return;
     const ctx = this.ctx;
@@ -1594,7 +1938,7 @@ export class Engine {
 
     ctx.font = this.font(460, small);
     const status = `${this.palette().label} · ${sd.label}`;
-    const controls = "F1 help   F4 style   Esc clear   Ctrl+S print";
+    const controls = "F1 help   F4 style   hold Esc clear   Ctrl+S print";
 
     ctx.globalAlpha = a;
     ctx.fillStyle = p.sub;
@@ -1631,6 +1975,114 @@ export class Engine {
     ctx.drawImage(wp.canvas, 0, easeOut(t) * 34 * this.dpr * Math.max(mm, 0.4));
     ctx.restore();
     ctx.globalAlpha = 1;
+  }
+
+  /**
+   * Esc held: a hairline of fresh ink draws itself along the horizon, left
+   * to right, as the sheet lifts. When it reaches the margin, the sheet goes.
+   */
+  private drawEscHold(fx: Tones, lift: number): void {
+    const ctx = this.ctx;
+    const t = clamp(lift, 0, 1);
+    const left = Math.round(this.marginX * 0.6);
+    const right = Math.round(this.w - this.marginX * 0.6);
+    const y = Math.round(this.typingY + this.fs * 0.2) + 0.5;
+    ctx.globalAlpha = 0.25 + 0.6 * t;
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(left + (right - left) * t, y);
+    ctx.stroke();
+    ctx.lineCap = "butt";
+    ctx.globalAlpha = 1;
+  }
+
+  /** The silent margin bell: a short accent tick at the right margin. */
+  private drawBell(fx: Tones, now: number, mm: number): void {
+    const t = (now - this.bellAt) / 420;
+    if (t < 0 || t >= 1) return;
+    const ctx = this.ctx;
+    const x = this.colX(this.maxCols) + this.advance * 0.6;
+    const y = this.typingY - this.fs * 0.35;
+    const r = this.fs * (0.28 + 0.5 * easeOut(t) * Math.max(mm, 0.3));
+    ctx.globalAlpha = (1 - t) * 0.8;
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(x, y, r, -Math.PI * 0.35, Math.PI * 0.35);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.55, -Math.PI * 0.3, Math.PI * 0.3);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  /**
+   * The ink bloom. The frame from before the change is drawn on top with a
+   * hole in it, and the hole grows: an irregular, slightly lobed blot, the
+   * way a drop spreads through damp paper, with a darker tide line where
+   * the wet edge is. Without motion it is a plain cross-fade.
+   */
+  private drawBloom(fx: Tones, now: number, mm: number): void {
+    const b = this.bloom!;
+    const ctx = this.ctx;
+    const dur = mm >= 1 ? BLOOM_MS : mm > 0 ? BLOOM_MS * 0.7 : 280;
+    const t = (now - b.at) / dur;
+    if (t >= 1) {
+      this.bloom = null;
+      return;
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (mm === 0) {
+      ctx.globalAlpha = 1 - t;
+      ctx.drawImage(b.canvas, 0, 0);
+      ctx.restore();
+      return;
+    }
+    // Reach: far enough to cover the farthest corner, with lobes to spare.
+    const reach =
+      Math.hypot(Math.max(b.x, this.w - b.x), Math.max(b.y, this.h - b.y)) * 1.18;
+    // Fast at first, slowing as it soaks out, like real ink.
+    const e = 1 - Math.pow(1 - t, 1.8);
+    const r0 = reach * e;
+    // Enough points that the edge stays a curve even at full-screen size.
+    const steps = Math.min(360, Math.max(48, Math.round(r0 / 6)));
+    const blot = new Path2D();
+    for (let k = 0; k <= steps; k++) {
+      const a = (k / steps) * Math.PI * 2;
+      const wob =
+        1 +
+        0.07 * Math.sin(a * 3 + b.seed) +
+        0.045 * Math.sin(a * 7 - b.seed * 1.7 + t * 2) +
+        0.025 * Math.sin(a * 13 + b.seed * 0.3);
+      const r = r0 * wob;
+      const px = (b.x + Math.cos(a) * r) * this.dpr;
+      const py = (b.y + Math.sin(a) * r) * this.dpr;
+      if (k === 0) blot.moveTo(px, py);
+      else blot.lineTo(px, py);
+    }
+    blot.closePath();
+
+    const hole = new Path2D();
+    hole.rect(0, 0, this.canvas.width, this.canvas.height);
+    hole.addPath(blot);
+    ctx.save();
+    ctx.clip(hole, "evenodd");
+    ctx.drawImage(b.canvas, 0, 0);
+    ctx.restore();
+
+    // The tide line: wet ink pools at the edge of the spread.
+    ctx.globalAlpha = 0.5 * (1 - t) * (1 - t);
+    ctx.strokeStyle = fx.freshS;
+    ctx.lineWidth = (1.5 + 5 * (1 - t)) * this.dpr;
+    ctx.stroke(blot);
+    ctx.globalAlpha = 0.18 * (1 - t);
+    ctx.lineWidth = (8 + 18 * (1 - t)) * this.dpr;
+    ctx.stroke(blot);
+    ctx.restore();
   }
 
   private drawHalftoneBands(p: Palette): void {
@@ -1685,8 +2137,8 @@ export class Engine {
       ["F7", `motion: ${["off", "subtle", "full"][this.prefs.motion]}`],
       ["F8", "keystroke odometer"],
       ["F9", `controls strip ${this.prefs.chrome ? "(shown)" : "(hidden)"}`],
-      ["Esc", "clear the page"],
-      ["Ctrl+Z", "bring back what you cleared"],
+      ["hold Esc", "clear the page"],
+      ["Ctrl+Z", "bring back what you cleared, even after a reload"],
       ["Ctrl+C", "copy everything you typed"],
       ["Ctrl+S", "save a print of your session"]
     ];
@@ -1700,7 +2152,7 @@ export class Engine {
       "tap a key: light. hold it: heavier. the page remembers.",
       "hold, then release: the letter stamps. feel the thump.",
       "type with an even rhythm and the page warms up to it.",
-      "the page knows words: fire, water, ice, wind, zen.",
+      "fire, water, ice, wind or zen alone on a line, then Enter.",
       "Ctrl+S saves a print of your rhythm."
     ];
 
