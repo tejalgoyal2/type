@@ -20,7 +20,8 @@ import { styleOf, STYLES, type StyleDef } from "./styles";
 import { Spring, landCurve, clamp, lerp, easeOut } from "./springs";
 import { Rhythm } from "./rhythm";
 import { EchoRecorder } from "./echo";
-import { downloadRhythmPrint } from "./rhythmprint";
+import { renderProof, showProof } from "./proof";
+import { Worlds, WORLD_IDS, type WorldId, type Row } from "./worlds";
 import {
   DOODLES,
   DOODLE_DRAW,
@@ -246,6 +247,8 @@ export class Engine {
   private captionPunch: Spring;
   private slideFrom = -1e9;
   private wipe: { canvas: HTMLCanvasElement; at: number } | null = null;
+  /** The weather the writing has called up, if any. */
+  private worlds = new Worlds();
   /** Blooms in flight, oldest first. Each keeps spreading on its own. */
   private blooms: Bloom[] = [];
   /** The last frame without any bloom on it, kept only while blooms run. */
@@ -375,7 +378,7 @@ export class Engine {
   }
 
   private palette(): Palette {
-    return PALETTES[this.prefs.palette % PALETTES.length]!;
+    return this.worlds.palette() ?? PALETTES[this.prefs.palette % PALETTES.length]!;
   }
 
   private style(): StyleDef {
@@ -836,6 +839,7 @@ export class Engine {
   }
 
   private setPalette(idx: number): void {
+    this.worlds.leave();
     this.prefs.palette = idx;
     document.body.style.background = this.palette().paper;
     this.dotPattern = null;
@@ -903,6 +907,7 @@ export class Engine {
       carry: null
     };
     this.active.splice(this.caretIdx, 0, g);
+    if (this.motionMul() > 0) this.worlds.key(this.colX(this.caretIdx) + this.advance / 2, this.typingY);
     this.caretIdx += 1;
     this.hasTyped = true;
     this.rhythm.record(now);
@@ -1035,6 +1040,34 @@ export class Engine {
   }
 
   /**
+   * A word opened a world: the page blooms into it from where the word
+   * sits. The first time each one is found, say so, quietly.
+   */
+  private enterWorld(id: WorldId, x: number, now: number): void {
+    this.startBloom(x, this.typingY - this.fs * 0.35);
+    this.dotPattern = null;
+    this.staticDirty = true;
+    document.body.style.background = this.palette().paper;
+    const key = `w${id}`;
+    if (!this.odo.found.includes(key)) {
+      this.odo.found.push(key);
+      this.dirtyOdo = true;
+      const n = this.odo.found.filter((f) => f.startsWith("w") && WORLD_IDS.includes(f.slice(1) as WorldId)).length;
+      this.toast(`found a world: ${id} · ${n} of ${WORLD_IDS.length}`);
+    }
+    void now;
+  }
+
+  /** The world went quiet: the page blooms back to its own colors. */
+  private leaveWorld(): void {
+    this.startBloom(this.w / 2, this.typingY - this.fs * 0.35);
+    this.worlds.leave();
+    this.dotPattern = null;
+    this.staticDirty = true;
+    document.body.style.background = this.palette().paper;
+  }
+
+  /**
    * Some words draw themselves. Reads the word just behind the caret (any
    * trailing punctuation skipped) and, if it has a doodle, sends one up.
    */
@@ -1049,6 +1082,8 @@ export class Engine {
       word = c.toLowerCase() + word;
     }
     if (word.length < 2) return;
+    const opened = this.worlds.hear(word, now);
+    if (opened) this.enterWorld(opened, this.colX(end - word.length) + (word.length * this.advance) / 2, now);
     const d = doodleForWord(word);
     if (!d) return;
     const last = this.doodleSeen.get(d.id) ?? -1e9;
@@ -1306,6 +1341,7 @@ export class Engine {
     canUndo: boolean;
     rafSkew: number;
     blooms: number;
+    world: string | null;
   } {
     if (this.staticDirty) this.renumber();
     return {
@@ -1329,7 +1365,8 @@ export class Engine {
       },
       canUndo: this.undoSlot !== null,
       rafSkew: this.rafSkew,
-      blooms: this.blooms.length
+      blooms: this.blooms.length,
+      world: this.worlds.id
     };
   }
 
@@ -1354,69 +1391,48 @@ export class Engine {
 
   // ------------------------------------------------------------- print
 
+  private proofOpen = false;
+
   private exportPrint(): void {
+    if (this.proofOpen) return;
     if (this.recorder.length < 8) {
       this.toast("type a little first, then Ctrl+S");
       return;
     }
     const p = this.palette();
     const sheet = this.serialize();
-    const glyphs = sheet.lines.flatMap((l) => (l.soft ? l.glyphs : [...l.glyphs, { ch: "\n", w: 400 }]));
-    glyphs.push(...sheet.active);
     const marks = sheet.lines.flatMap((l) => l.marks).concat(sheet.activeMarks);
-    const canvas = downloadRhythmPrint({
+    const canvas = renderProof({
       echo: this.recorder.toEcho(),
-      glyphs,
       marks,
-      pal: { paper: p.paper, ink: p.ink, fresh: p.fresh, sub: p.sub, misA: p.misA, misB: p.misB, dark: p.dark },
-      stats: { keys: this.recorder.length, styleLabel: this.style().label, paletteLabel: p.label }
+      pal: { paper: p.paper, ink: p.ink, fresh: p.fresh, sub: p.sub, dark: p.dark },
+      wpm: this.shownWpm
     });
-    if (canvas) {
-      this.proof = { canvas, at: performance.now() };
-      this.impact.kick(60 * this.motionMul());
-    }
-    this.toast(canvas ? "proof pulled. it's in your downloads" : "nothing to print yet");
-  }
-
-  /** The proof slides out over the page like a sheet off the press. */
-  private proof: { canvas: HTMLCanvasElement; at: number } | null = null;
-
-  private drawProof(p: Palette, now: number, mm: number): void {
-    const pr = this.proof!;
-    const t = now - pr.at;
-    const LIFE = 3000;
-    if (t > LIFE) {
-      this.proof = null;
+    if (!canvas) {
+      this.toast("nothing to show yet");
       return;
     }
-    const ctx = this.ctx;
-    const sh = Math.min(this.h * 0.8, (this.w * 0.86) / 0.75);
-    const sw = sh * 0.75;
-    const x = (this.w - sw) / 2;
-    const rest = (this.h - sh) / 2;
-    let y = rest;
-    let a = 1;
-    if (mm > 0) {
-      const enter = clamp(t / 650, 0, 1);
-      const spring = 1 - Math.exp(-6 * enter) * Math.cos(7 * enter);
-      y = -sh + (rest + sh) * spring;
-      if (t > 2300) {
-        const out = easeOut((t - 2300) / 700);
-        y = rest + out * this.h * 0.9;
-        a = 1 - out;
-      }
-    } else {
-      a = t < 300 ? t / 300 : t > 2600 ? 1 - (t - 2600) / 400 : 1;
-    }
-    ctx.globalAlpha = 0.55 * Math.min(1, t / 250) * (t > 2300 ? 1 - clamp((t - 2300) / 700, 0, 1) : 1);
-    ctx.fillStyle = p.paper;
-    ctx.fillRect(0, 0, this.w, this.h);
-    ctx.globalAlpha = a;
-    ctx.fillStyle = "rgba(0,0,0,0.22)";
-    ctx.fillRect(x + 8, y + 12, sw, sh);
-    ctx.drawImage(pr.canvas, x, y, sw, sh);
-    ctx.globalAlpha = 1;
+    this.releaseAll(performance.now());
+    this.proofOpen = true;
+    void showProof(canvas, p).then(() => {
+      this.proofOpen = false;
+    });
   }
+
+  /** Rows on screen for the weather to settle on, newest last. */
+  private worldRows(dy: number): Row[] {
+    const rows: Row[] = [];
+    const top = this.historyFade().fadeTop;
+    for (let k = Math.min(this.lines.length, 40); k >= 1; k--) {
+      const y = this.typingY - this.lineHeight * k + dy;
+      if (y < top) continue;
+      const line = this.lines[this.lines.length - k]!;
+      rows.push({ id: this.lines.length - k, y, xs: this.marginX, text: line.glyphs.map((g) => g.ch).join("") });
+    }
+    rows.push({ id: this.lines.length, y: this.typingY, xs: this.marginX, text: this.active.map((g) => g.ch).join("") });
+    return rows;
+  }
+
 
   // ------------------------------------------------------------ frame
 
@@ -1432,6 +1448,9 @@ export class Engine {
     const dt = clamp((t - this.prev) / 1000, 0, 0.04);
     this.prev = t;
     this.dt = dt;
+
+    this.worlds.update(this.motionMul() > 0 ? dt : 0, this.shownWpm, this.w, this.h);
+    if (this.worlds.expired(t)) this.leaveWorld();
 
     // Signals
     const flow = this.rhythm.flow(t);
@@ -1545,6 +1564,8 @@ export class Engine {
     // The writing surface: a faint full-height ruled sheet the text sits on,
     // brightest at the active line. Drawn under all ink.
     this.drawRules(fx, now, mm);
+    const weather = this.worlds.active();
+    if (weather) this.worlds.back(ctx);
 
     // Holding Esc lifts the writing off the page: it rises and thins out
     // as the hold goes on, and drops back if you let go early.
@@ -1606,6 +1627,7 @@ export class Engine {
     this.drawActiveMarks(fx, now);
     this.drawDying(fx, now);
     this.drawCaret(sd, fx, now, mm);
+    if (weather) this.worlds.front(ctx, this.canvas, this.worldRows(slide + liftY), this.fs, this.advance);
     if (lift > 0.001) this.drawEscHold(fx, lift);
     this.drawBell(fx, now, mm);
     if (this.prefs.seismo) this.drawSeismo(p, fx, now);
@@ -1617,7 +1639,6 @@ export class Engine {
     if (this.lights) this.drawLights(now, mm);
     if (this.blooms.length) this.drawBlooms(fx, now, mm);
     if (this.wipe) this.drawWipe(now, mm);
-    if (this.proof) this.drawProof(p, now, mm);
     if (this.helpOpen) this.drawHelp(p, sd);
     if (this.statsOpen) this.drawStats(p, fx);
   }

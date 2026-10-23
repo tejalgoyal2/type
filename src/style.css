@@ -17,3 +17,60 @@ body {
   height: 100%;
   cursor: text;
 }
+
+/* The proof: shown over the page, saved only if you ask. */
+.proof {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  padding: 16px;
+  background: color-mix(in srgb, var(--paper) 72%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  z-index: 10;
+}
+.proof.open {
+  opacity: 1;
+}
+.proof img {
+  width: min(92vw, calc((100vh - 120px) * 1.5));
+  aspect-ratio: 3 / 2;
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 24px 60px -18px rgba(0, 0, 0, 0.35);
+  transform: translateY(14px) scale(0.985);
+  transition: transform 0.45s cubic-bezier(0.2, 0.9, 0.2, 1.1);
+}
+.proof.open img {
+  transform: none;
+}
+.proof-bar {
+  display: flex;
+  gap: 10px;
+}
+.proof button {
+  font: 500 14px "JetBrains Mono", ui-monospace, monospace;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--ink) 35%, transparent);
+  border-radius: 999px;
+  padding: 8px 20px;
+  cursor: pointer;
+}
+.proof button:hover,
+.proof button:focus-visible {
+  background: var(--ink);
+  color: var(--paper);
+  outline: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .proof,
+  .proof img {
+    transition: none;
+  }
+}

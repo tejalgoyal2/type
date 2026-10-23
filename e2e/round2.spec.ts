@@ -1,6 +1,5 @@
 import { test, expect } from "@playwright/test";
 import { PNG } from "pngjs";
-import { readFile } from "node:fs/promises";
 import { open, probe, reload, expectText, MOD } from "./helpers";
 
 test("words draw doodles that settle into the margin and stay", async ({ page }) => {
@@ -25,15 +24,26 @@ test("words draw doodles that settle into the margin and stay", async ({ page })
   expect(p.found).toEqual(expect.arrayContaining(["sun", "coffee"]));
 });
 
-test("Ctrl+S pulls a rhythm proof", async ({ page }) => {
+test("Ctrl+S shows the proof, and only saves when asked", async ({ page }) => {
   await open(page);
   await page.keyboard.type("a few honest words under the moon\nand a second line", { delay: 20 });
-  const download = page.waitForEvent("download");
+  let downloads = 0;
+  page.on("download", () => downloads++);
   await page.keyboard.press(`${MOD}+s`);
-  const d = await download;
-  expect(d.suggestedFilename()).toMatch(/^type-proof-\d{8}\.png$/);
-  const png = PNG.sync.read(await readFile((await d.path())!));
-  expect([png.width, png.height]).toEqual([1500, 2000]);
+  const img = page.locator(".proof img");
+  await expect(img).toBeVisible();
+  await expect.poll(() => img.evaluate((i: HTMLImageElement) => [i.naturalWidth, i.naturalHeight])).toEqual([1800, 1200]);
+  expect(downloads).toBe(0);
+  // Keys go to the popup, not the page.
+  await page.keyboard.type("xyz");
+  expect((await probe(page)).text).not.toContain("xyz");
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "save" }).click();
+  expect((await download).suggestedFilename()).toMatch(/^type-\d{8}\.png$/);
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".proof")).toHaveCount(0);
+  await page.keyboard.type("!");
+  expect((await probe(page)).text.endsWith("!")).toBe(true);
 });
 
 test("rolling keys together is noticed", async ({ page }) => {
@@ -125,4 +135,17 @@ test("quick palette changes stack their blooms instead of cutting each other off
   await page.keyboard.press("F2");
   expect((await probe(page)).blooms).toBe(3);
   await expect.poll(async () => (await probe(page)).blooms, { timeout: 4000 }).toBe(0);
+});
+
+test("a word opens a world, and the page keeps its own colors underneath", async ({ page }) => {
+  await open(page, { prefs: { palette: 0 } });
+  await page.keyboard.type("the rain came in sideways ");
+  expect((await probe(page)).world).toBe("rain");
+  await page.keyboard.type("then the snow ");
+  expect((await probe(page)).world).toBe("snow");
+  // Changing the palette by hand leaves the world.
+  await page.keyboard.press("F2");
+  const p = await probe(page);
+  expect(p.world).toBe(null);
+  expect(p.prefs.palette).not.toBe(0);
 });

@@ -62,15 +62,18 @@ the instrument, the page just listens.
   the start of a line pulls the line above back down.
 - An odometer (F8) counts lifetime keystrokes, your most-pressed keys, your
   best flow and your longest streak.
-- The rhythm proof. Ctrl+S pulls a press proof of your session and it
-  slides out over the page. Its seal is a guilloche (banknote line-work)
-  made from how you typed: a rope whose lobes come from your pace, a
-  rosette woven from your cadence and steadiness, a ring that is your
-  actual keystroke gaps wrapped once around the circle, and a sunflower
-  of every keystroke at the center. Below it, your last words in the
-  weights you pressed, your margin doodles, a rhythm strip of the whole
-  session, crop marks and a colophon, with an edition number that is a
-  hash of the session. Same session, same proof.
+- Worlds. The page listens to what you write. Mention rain and it turns
+  into a window in a downpour, beads on the glass bending the page behind
+  them, lightning if it storms. Wind turns it to a pencil sketch with gusts
+  curling across. Night goes to a phosphor terminal sky with tonight's
+  real moon phase, dithered. Snow piles on the tops of your letters. Sun,
+  fire and sea have their own light. Each world blooms in from the word
+  that called it, your typing speed drives its weather, and it lets go
+  about a minute after you stop mentioning it.
+- The proof. Ctrl+S shows what your hands drew: every word as one stroke
+  across the keyboard, through the keys it was typed on. Quick bursts in
+  the fresh color, slow words bow wider, later words darker. Your doodles
+  sit under it. It opens over the page; save it if you want it.
 - Everything you write is kept, however long, and survives reloads. Hold
   Esc to clear the sheet; Ctrl+Z brings it back, even after a reload.
   Nothing leaves your browser.
@@ -92,7 +95,7 @@ Everything is keyboard-driven. The mouse is never needed.
 | hold Esc | Clear the sheet (a tap does nothing)                  |
 | Ctrl+Z   | Bring back the cleared sheet (press again to swap back) |
 | Ctrl+C   | Copy everything you typed                             |
-| Ctrl+S   | Pull a rhythm proof (PNG) of this session             |
+| Ctrl+S   | Show the proof of this session (save it from there)   |
 | click    | Send a ripple through the letters                     |
 
 F11 (browser fullscreen) is left to the browser on purpose; it makes the
@@ -187,9 +190,11 @@ DNS record automatically.
   from age, like the glyphs. Margin doodles are stored with each line.
 - Click waves redraw the history layer in small tiles, each pushed by the
   passing wave, only while a wave is alive.
-- The rhythm proof is a one-shot off-screen render (polar curves, a
-  phyllotaxis spiral, paper grain) encoded with toBlob. It never runs on
-  the hot path.
+- Worlds draw in two layers, one behind the ink and one in front, and
+  cost nothing when no world is open. Rain beads refract a third-size copy
+  of the frame, taken once per frame only while it rains.
+- The proof is a one-shot off-screen render encoded with toBlob. It never
+  runs on the hot path.
 - The render loop schedules its next frame before doing any work, so one
   bad frame can never freeze the page.
 - All persistence is localStorage with try/catch guards; the site works
