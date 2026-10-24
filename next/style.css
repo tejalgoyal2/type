@@ -1,0 +1,250 @@
+:root {
+  --desk: #121314;
+  --ink: #ececec;
+  --ghost: #55585c;
+  --accent: #ff6a00;
+  --panel: rgba(18, 19, 20, 0.82);
+  --mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--desk);
+  color: var(--ink);
+  font-family: var(--mono);
+  -webkit-font-smoothing: antialiased;
+  touch-action: manipulation;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: text;
+}
+
+/* Soft keyboards need something focusable; it never shows. */
+#sink {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  border: 0;
+  padding: 0;
+  resize: none;
+  font-size: 16px;
+  caret-color: transparent;
+}
+
+.hud {
+  position: fixed;
+  inset: 0 0 auto 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: max(18px, env(safe-area-inset-top)) 22px 0;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: lowercase;
+  pointer-events: none;
+  transition: opacity 0.5s ease;
+}
+.hud.quiet {
+  opacity: 0.35;
+}
+.hud.zen {
+  opacity: 0;
+}
+.mark b {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  font-size: 15px;
+  margin-right: 12px;
+}
+.mark span,
+.read {
+  color: var(--ghost);
+}
+.read {
+  display: flex;
+  gap: 18px;
+  font-variant-numeric: tabular-nums;
+}
+.read i {
+  font-style: normal;
+  color: var(--ink);
+  font-weight: 650;
+  margin-right: 5px;
+}
+.read .hot i {
+  color: var(--accent);
+}
+
+.toasts {
+  position: fixed;
+  top: max(50px, calc(env(safe-area-inset-top) + 34px));
+  right: 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 3;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px 8px 10px;
+  border-radius: 999px;
+  background: var(--panel);
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 9%, transparent), 0 10px 30px -12px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  animation: toast-in 0.42s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+}
+.toast.out {
+  animation: toast-out 0.32s ease both;
+}
+.toast em {
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--desk);
+  font-weight: 750;
+}
+.toast small {
+  color: var(--ghost);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px) scale(0.92);
+  }
+}
+@keyframes toast-out {
+  to {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.96);
+  }
+}
+
+.hint {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: var(--hint-y, 40%);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--ghost);
+  opacity: 0;
+  transition: opacity 0.8s ease;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.hint.on {
+  opacity: 1;
+}
+
+.help {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--desk) 70%, transparent);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  z-index: 5;
+  animation: fade 0.25s ease both;
+}
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+.help .sheet {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 40px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.help h2 {
+  grid-column: 1 / -1;
+  margin: 0 0 6px;
+  font-size: 13px;
+  letter-spacing: 0.16em;
+  font-weight: 750;
+  color: var(--accent);
+}
+.help h3 {
+  margin: 14px 0 4px;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  color: var(--ghost);
+  font-weight: 600;
+}
+.help dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 14px;
+}
+.help dt {
+  font-weight: 700;
+  white-space: nowrap;
+}
+.help dd {
+  margin: 0;
+  color: color-mix(in srgb, var(--ink) 70%, transparent);
+}
+.help ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  columns: 2;
+  column-gap: 18px;
+}
+.help li {
+  break-inside: avoid;
+  color: color-mix(in srgb, var(--ink) 80%, transparent);
+}
+.help li.no {
+  color: var(--ghost);
+  opacity: 0.6;
+}
+.help .foot {
+  grid-column: 1 / -1;
+  margin-top: 12px;
+  color: var(--ghost);
+}
+@media (max-width: 640px) {
+  .help .sheet {
+    grid-template-columns: 1fr;
+  }
+  .read .opt {
+    display: none;
+  }
+}
+.help[hidden] {
+  display: none;
+}
