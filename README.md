@@ -62,14 +62,21 @@ the instrument, the page just listens.
   the start of a line pulls the line above back down.
 - An odometer (F8) counts lifetime keystrokes, your most-pressed keys, your
   best flow and your longest streak.
-- Worlds. The page listens to what you write. Mention rain and it turns
-  into a window in a downpour, beads on the glass bending the page behind
-  them, lightning if it storms. Wind turns it to a pencil sketch with gusts
-  curling across. Night goes to a phosphor terminal sky with tonight's
-  real moon phase, dithered. Snow piles on the tops of your letters. Sun,
-  fire and sea have their own light. Each world blooms in from the word
-  that called it, your typing speed drives its weather, and it lets go
-  about a minute after you stop mentioning it.
+- Worlds. The page listens to what you write, and each world has its own
+  personality. Rain (or night) is a lofi window: city lights out of focus
+  behind the glass, rain slanting past, lightning if it storms. Matrix
+  pours code down the page, every letter lets a stream fall from where it
+  landed and decodes out of noise. Terminal is an amber phosphor tube that
+  boots when you open it: scanlines, a rolling refresh, glowing ink.
+  Sakura is spring in an anime: light pouring in, petals fluttering edge
+  on, sparkles where your keys land. Wind turns the page to a pencil
+  sketch, snow piles on your letters, sun, fire and sea have their own
+  light. Each world blooms in from the word that called it, your typing
+  speed drives its weather, and it lets go about a minute after you stop
+  mentioning it.
+- The camera. The page is filmed: the lens leans toward the pen and
+  pushes in as you speed up, focus racks onto the line you are writing,
+  and on a long pause the camera drifts over what you wrote.
 - The proof. Ctrl+S shows what your hands drew: every word as one stroke
   across the keyboard, through the keys it was typed on. Quick bursts in
   the fresh color, slow words bow wider, later words darker. Your doodles

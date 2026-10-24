@@ -13,7 +13,7 @@
  */
 import type { Palette } from "./palettes";
 
-export type WorldId = "rain" | "wind" | "night" | "snow" | "sun" | "fire" | "sea";
+export type WorldId = "rain" | "wind" | "snow" | "sun" | "fire" | "sea" | "matrix" | "terminal" | "sakura";
 
 export interface Row {
   id: number;
@@ -44,8 +44,8 @@ function pal(
 const DEFS: Def[] = [
   {
     id: "rain",
-    words: "rain rains rainy raining rained drizzle downpour storm stormy thunder lightning umbrella puddle puddles monsoon showers".split(" "),
-    pal: pal("rain", true, "#16202A", "#D6E0EA", "#8EC5EE", "#34465A", "#8EC5EE", "#0E151C")
+    words: "rain rains rainy raining rained drizzle downpour storm stormy thunder lightning umbrella puddle puddles monsoon showers night nights midnight tonight lofi cozy city".split(" "),
+    pal: pal("rain", true, "#1A1B30", "#ECE6F7", "#FFB38A", "#3A3B5E", "#FFB38A", "#1A1B30")
   },
   {
     id: "wind",
@@ -53,9 +53,19 @@ const DEFS: Def[] = [
     pal: pal("wind", false, "#EEE9DE", "#2E2F35", "#6E6F78", "#CBC4B5", "#2E2F35", "#EEE9DE")
   },
   {
-    id: "night",
-    words: "night nights midnight tonight dark darkness stars starry moon moonlight galaxy cosmos universe space orbit nebula".split(" "),
-    pal: pal("night", true, "#04070D", "#9CF0C4", "#E8FFF3", "#173528", "#9CF0C4", "#04070D")
+    id: "matrix",
+    words: "matrix code coding coder hack hacker hacking neo glitch digital cyber cyberpunk simulation binary algorithm".split(" "),
+    pal: pal("matrix", true, "#010A04", "#8DFFA8", "#E4FFEA", "#0E3B1E", "#8DFFA8", "#010A04")
+  },
+  {
+    id: "terminal",
+    words: "terminal computer computers linux unix bash shell console command sudo server retro program programming kernel".split(" "),
+    pal: pal("terminal", true, "#0E0A04", "#FFB940", "#FFE7B0", "#4A3410", "#FFB940", "#0E0A04")
+  },
+  {
+    id: "sakura",
+    words: "sakura cherry blossom blossoms petal petals spring anime manga tokyo kyoto japan hanami".split(" "),
+    pal: pal("sakura", false, "#FFF3F4", "#3B2235", "#FF4F8B", "#F2C9D3", "#FF4F8B", "#FFF3F4")
   },
   {
     id: "snow",
@@ -118,31 +128,6 @@ function glow(rgb: string): HTMLCanvasElement {
   });
 }
 
-/** Shading for a water bead on glass: dark lower rim, bright upper glint. */
-function beadSprite(): HTMLCanvasElement {
-  return sprite(64, (c, s) => {
-    const r = s / 2;
-    const rim = c.createRadialGradient(r, r * 0.8, r * 0.55, r, r, r);
-    rim.addColorStop(0, "rgba(0,0,0,0)");
-    rim.addColorStop(0.8, "rgba(4,10,18,0.25)");
-    rim.addColorStop(1, "rgba(4,10,18,0.55)");
-    c.fillStyle = rim;
-    c.beginPath();
-    c.arc(r, r, r - 0.5, 0, Math.PI * 2);
-    c.fill();
-    const lit = c.createRadialGradient(r * 0.72, r * 0.62, 0, r * 0.72, r * 0.62, r * 0.42);
-    lit.addColorStop(0, "rgba(255,255,255,0.9)");
-    lit.addColorStop(1, "rgba(255,255,255,0)");
-    c.fillStyle = lit;
-    c.fillRect(0, 0, s, s);
-    c.strokeStyle = "rgba(220,238,255,0.35)";
-    c.lineWidth = 1.5;
-    c.beginPath();
-    c.arc(r, r, r * 0.78, Math.PI * 0.15, Math.PI * 0.85);
-    c.stroke();
-  });
-}
-
 /** Graphite: a speckled grey that makes any stroke read as pencil. */
 function graphite(c: CanvasRenderingContext2D): CanvasPattern | null {
   const g = sprite(48, (x, s) => {
@@ -169,33 +154,6 @@ function grain(c: CanvasRenderingContext2D): CanvasPattern | null {
   });
   return c.createPattern(g, "repeat");
 }
-
-/** Today's moon, dithered: phase from the real date. */
-function moonSprite(): HTMLCanvasElement {
-  const days = (Date.now() - Date.UTC(2000, 0, 6, 18, 14)) / 86400000;
-  const phase = ((days % 29.530588) + 29.530588) % 29.530588 / 29.530588; // 0 new, .5 full
-  const bayer = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-  return sprite(40, (c, s) => {
-    const r = s / 2 - 2;
-    for (let y = 0; y < s; y++) {
-      for (let x = 0; x < s; x++) {
-        const dx = (x - s / 2 + 0.5) / r;
-        const dy = (y - s / 2 + 0.5) / r;
-        if (dx * dx + dy * dy > 1) continue;
-        // The terminator: an ellipse sweeping across the disc with the phase.
-        const z = Math.sqrt(1 - dy * dy);
-        const k = Math.cos(phase * Math.PI * 2);
-        const lit = phase < 0.5 ? dx > k * z : dx < -k * z;
-        const shade = lit ? 0.85 - 0.25 * (dx * dx + dy * dy) : 0.07;
-        if (shade * 16 > bayer[(y % 4) * 4 + (x % 4)]!) {
-          c.fillStyle = "#9CF0C4";
-          c.fillRect(x, y, 1, 1);
-        }
-      }
-    }
-  });
-}
-
 interface P {
   x: number;
   y: number;
@@ -218,34 +176,89 @@ interface Gust {
   speed: number;
 }
 
+/** Matrix: the cell size of the falling code, and what it is made of. */
+const CELL = 18;
+const KANA = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ012345789Z:=*+<>|";
+const MONO = '"JetBrains Mono Variable", ui-monospace, monospace';
+
+interface Petal extends P {
+  rot: number;
+  vr: number;
+  spin: number;
+  vs: number;
+  k: number;
+}
+
+function petal(x: number, y: number, l = 0): Petal {
+  return { ...part(x, y, 0, 0, R(), l), rot: R() * 6.28, vr: (R() - 0.5) * 2.4, spin: R() * 6.28, vs: 2 + R() * 4, k: Math.floor(R() * 3) };
+}
+
+/** A cherry petal, notched at the tip, deeper pink at the base. */
+function petalSprite(base: string, tip: string): HTMLCanvasElement {
+  return sprite(64, (c, s) => {
+    const r = s * 0.46;
+    c.translate(s / 2, s / 2);
+    const g = c.createLinearGradient(0, r, 0, -r);
+    g.addColorStop(0, base);
+    g.addColorStop(1, tip);
+    c.fillStyle = g;
+    c.beginPath();
+    c.moveTo(0, -0.62 * r);
+    c.quadraticCurveTo(-0.18 * r, -1.0 * r, -0.42 * r, -0.86 * r);
+    c.bezierCurveTo(-0.95 * r, -0.5 * r, -0.6 * r, 0.55 * r, 0, r);
+    c.bezierCurveTo(0.6 * r, 0.55 * r, 0.95 * r, -0.5 * r, 0.42 * r, -0.86 * r);
+    c.quadraticCurveTo(0.18 * r, -1.0 * r, 0, -0.62 * r);
+    c.fill();
+    // A faint vein, the way petals catch light.
+    c.strokeStyle = "rgba(255,255,255,0.45)";
+    c.lineWidth = 1.2;
+    c.beginPath();
+    c.moveTo(0, 0.8 * r);
+    c.quadraticCurveTo(0.05 * r, 0, 0, -0.5 * r);
+    c.stroke();
+  });
+}
+
+/** A four-point sparkle, the anime kind. */
+function sparklePath(c: CanvasRenderingContext2D, r: number): void {
+  c.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2 - Math.PI / 2;
+    const rr = i % 2 === 0 ? r : r * 0.22;
+    c.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  c.closePath();
+}
+
 export class Worlds {
   id: WorldId | null = null;
   private heardAt = 0;
   private intensity = 0;
-  private lv: Record<WorldId, number> = { rain: 0, wind: 0, night: 0, snow: 0, sun: 0, fire: 0, sea: 0 };
+  private lv: Record<WorldId, number> = { rain: 0, wind: 0, snow: 0, sun: 0, fire: 0, sea: 0, matrix: 0, terminal: 0, sakura: 0 };
   private energy = 0;
   private t = 0;
   private w = 1;
   private h = 1;
 
-  // rain
-  private streaks: P[] = [];
-  private beads: P[] = [];
-  private splashes: P[] = [];
+  // rain: lofi, at night, through glass
+  private drops: P[] = [];
+  private bokeh: P[] = [];
+  private bokehSprites: HTMLCanvasElement[] | null = null;
   private flash = 0;
-  private bolt: number[] | null = null;
-  private lens: HTMLCanvasElement | null = null;
-  private bead: HTMLCanvasElement | null = null;
   // wind
   private gusts: Gust[] = [];
   private leaves: P[] = [];
   private pencil: CanvasPattern | null = null;
-  // night
-  private stars: P[] = [];
-  private moon: HTMLCanvasElement | null = null;
-  private sparks: P[] = [];
-  private shooting: P | null = null;
+  // matrix
+  private code: HTMLCanvasElement | null = null;
+  private cols: { y: number; v: number; cell: number }[] = [];
+  // terminal
   private scan: CanvasPattern | null = null;
+  private boot = 0;
+  // sakura
+  private petals: Petal[] = [];
+  private petalSprites: HTMLCanvasElement[] | null = null;
+  private sparkles: P[] = [];
   // snow
   private flakes: P[] = [];
   private caps = new Map<number, Float32Array>();
@@ -295,12 +308,20 @@ export class Worlds {
     const id = this.id;
     if (!id) return;
     if (id === "rain") {
-      for (let i = 0; i < 5; i++) this.splashes.push(part(x, y, (R() - 0.5) * 160, -90 - R() * 120, 0, 0.45));
       this.rings.push(part(x, y, 0, 0, 1, 0.7));
     } else if (id === "wind") {
       if (this.gusts.length < 14) this.gusts.push(this.gust(x - 40, y - 18, 160 + R() * 120, true));
-    } else if (id === "night") {
-      for (let i = 0; i < 3; i++) this.sparks.push(part(x + (R() - 0.5) * 10, y - 14, (R() - 0.5) * 30, -40 - R() * 50, 0, 0.6));
+    } else if (id === "matrix") {
+      // Every letter lets a stream of code fall from where it landed.
+      const col = this.cols[Math.floor(x / CELL)];
+      if (col) {
+        col.y = y;
+        col.v = 24 + R() * 8;
+        col.cell = -1;
+      }
+    } else if (id === "sakura") {
+      for (let i = 0; i < 3; i++) this.sparkles.push(part(x + (R() - 0.5) * 34, y - 18 - R() * 26, 0, -10, 4 + R() * 7, 0.45 + R() * 0.3));
+      if (R() < 0.6) this.petals.push(petal(x, y - 14, 3.5));
     } else if (id === "snow") {
       for (let i = 0; i < 6; i++) this.flakes.push(part(x, y - 12, (R() - 0.5) * 70, -40 - R() * 50, 0.4 + R() * 0.5, 2.6));
     } else if (id === "sun") {
@@ -333,8 +354,10 @@ export class Worlds {
     const s = dt * pace;
     this.t += s;
     if (this.lv.rain) this.stepRain(s);
+    if (this.lv.matrix) this.stepMatrix(s);
+    if (this.lv.terminal) this.boot += dt;
+    if (this.lv.sakura) this.stepSakura(s);
     if (this.lv.wind) this.stepWind(s);
-    if (this.lv.night) this.stepNight(s);
     if (this.lv.snow) this.stepSnow(s);
     if (this.lv.sun) this.stepSun(s);
     if (this.lv.fire) this.stepFire(s);
@@ -343,16 +366,19 @@ export class Worlds {
 
   private drop(id: WorldId): void {
     if (id === "rain") {
-      this.streaks = [];
-      this.beads = [];
-      this.splashes = [];
-      this.bolt = null;
+      this.drops = [];
+      this.flash = 0;
     } else if (id === "wind") {
       this.gusts = [];
       this.leaves = [];
-    } else if (id === "night") {
-      this.sparks = [];
-      this.shooting = null;
+    } else if (id === "matrix") {
+      this.code = null;
+      this.cols = [];
+    } else if (id === "terminal") {
+      this.boot = 0;
+    } else if (id === "sakura") {
+      this.petals = [];
+      this.sparkles = [];
     } else if (id === "snow") {
       this.flakes = [];
       this.caps.clear();
@@ -361,61 +387,6 @@ export class Worlds {
   }
 
   // ------------------------------------------------------------ steps
-
-  private stepRain(s: number): void {
-    const { w, h } = this;
-    const want = Math.round(170 * this.lv.rain * (0.5 + this.intensity * 0.6));
-    while (this.streaks.length < want) {
-      const z = R();
-      this.streaks.push(part(R() * w * 1.1, R() * h, 0, 900 + z * 900, z));
-    }
-    if (this.streaks.length > want) this.streaks.length = want;
-    for (const p of this.streaks) {
-      p.y += p.vy * s;
-      p.x += p.vy * 0.12 * s;
-      if (p.y > h + 40) {
-        p.y = -60 - R() * 80;
-        p.x = R() * w * 1.1 - w * 0.08;
-      }
-    }
-    // Beads on the glass: most rest, the heavy ones run.
-    const beads = Math.round(120 * this.lv.rain);
-    while (this.beads.length < beads) {
-      const r = R() < 0.3 ? 5 + R() * 8 : 1.4 + R() * 2.8;
-      this.beads.push(part(R() * w, R() * h, 0, 0, r));
-    }
-    for (const b of this.beads) {
-      b.a += s;
-      if (b.z > 7 && b.vy === 0 && R() < s * 0.06) b.vy = 30;
-      if (b.vy > 0) {
-        b.vy = Math.min(220, b.vy + 120 * s);
-        b.y += b.vy * s;
-        b.x += Math.sin(b.a * 7 + b.s) * 6 * s;
-        if (b.l === 0) b.l = b.y; // trail starts where it began to run
-        if (b.y - b.z > h) Object.assign(b, part(R() * w, -10 - R() * h * 0.3, 0, 0, b.z));
-      }
-    }
-    for (const p of this.splashes) {
-      p.a += s;
-      p.vy += 700 * s;
-      p.x += p.vx * s;
-      p.y += p.vy * s;
-    }
-    this.splashes = this.splashes.filter((p) => p.a < p.l);
-    // Storm words bring lightning.
-    this.flash = Math.max(0, this.flash - s * 3.2);
-    if (this.intensity > 0.85 && R() < s * 0.09) {
-      this.flash = 1;
-      const pts: number[] = [];
-      let x = w * (0.15 + R() * 0.7);
-      for (let y = 0; y < h * 0.62; y += 18 + R() * 26) {
-        pts.push(x, y);
-        x += (R() - 0.5) * 60;
-      }
-      this.bolt = pts;
-    }
-    if (this.flash === 0) this.bolt = null;
-  }
 
   private gust(x: number, y: number, len: number, curl: boolean): Gust {
     const pts: number[] = [];
@@ -453,26 +424,6 @@ export class Worlds {
       l.x += (150 + this.energy * 160 + Math.sin(l.a * 1.3 + l.s) * 60) * s * l.z;
       l.y += (Math.sin(l.a * 2.1 + l.s) * 50 + 14) * s;
       if (l.x > w + 60 || l.y > h + 60) Object.assign(l, part(-60, R() * h * 0.9, 0, 0, l.z));
-    }
-  }
-
-  private stepNight(s: number): void {
-    const { w, h } = this;
-    if (!this.stars.length) {
-      const r = rng(1931);
-      for (let i = 0; i < 170; i++) this.stars.push({ x: r(), y: r() * 0.78, vx: 0, vy: 0, z: r(), a: 0, l: 0, s: r() * 100 });
-    }
-    for (const p of this.sparks) {
-      p.a += s;
-      p.x += p.vx * s;
-      p.y += p.vy * s;
-    }
-    this.sparks = this.sparks.filter((p) => p.a < p.l);
-    if (this.shooting) {
-      this.shooting.a += s;
-      if (this.shooting.a > this.shooting.l) this.shooting = null;
-    } else if (R() < s * (0.05 + this.energy * 0.12)) {
-      this.shooting = part(w * (0.1 + R() * 0.7), h * (0.05 + R() * 0.3), 520 + R() * 300, 180 + R() * 120, 0, 0.7);
     }
   }
 
@@ -556,7 +507,8 @@ export class Worlds {
   back(c: CanvasRenderingContext2D): void {
     c.save();
     if (this.lv.rain) this.backRain(c, this.lv.rain);
-    if (this.lv.night) this.backNight(c, this.lv.night);
+    if (this.lv.matrix) this.backMatrix(c, this.lv.matrix);
+    if (this.lv.sakura) this.backSakura(c, this.lv.sakura);
     if (this.lv.snow) this.backSnow(c, this.lv.snow);
     if (this.lv.sun) this.backSun(c, this.lv.sun);
     if (this.lv.fire) this.backFire(c, this.lv.fire);
@@ -570,9 +522,11 @@ export class Worlds {
    */
   front(c: CanvasRenderingContext2D, page: HTMLCanvasElement, rows: Row[], fs: number, advance: number): void {
     c.save();
-    if (this.lv.rain) this.frontRain(c, page, this.lv.rain);
+    if (this.lv.rain) this.frontRain(c, this.lv.rain);
+    void page;
     if (this.lv.wind) this.frontWind(c, this.lv.wind);
-    if (this.lv.night) this.frontNight(c, this.lv.night);
+    if (this.lv.terminal) this.frontTerminal(c, this.lv.terminal);
+    if (this.lv.sakura) this.frontSakura(c, this.lv.sakura);
     if (this.lv.snow) this.frontSnow(c, rows, fs, advance, this.lv.snow);
     if (this.lv.sun) this.frontSun(c, this.lv.sun);
     if (this.lv.fire) this.frontFire(c, this.lv.fire);
@@ -580,99 +534,6 @@ export class Worlds {
     c.restore();
     c.globalAlpha = 1;
     c.globalCompositeOperation = "source-over";
-  }
-
-  private backRain(c: CanvasRenderingContext2D, lv: number): void {
-    const { w, h } = this;
-    const g = c.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, `rgba(6,10,16,${0.45 * lv})`);
-    g.addColorStop(1, `rgba(60,96,130,${0.22 * lv})`);
-    c.fillStyle = g;
-    c.fillRect(0, 0, w, h);
-    // Rain falling beyond the glass, in three depths.
-    for (let band = 0; band < 3; band++) {
-      c.beginPath();
-      for (const p of this.streaks) {
-        if (Math.min(2, Math.floor(p.z * 3)) !== band) continue;
-        const len = 18 + p.z * 46;
-        c.moveTo(p.x, p.y);
-        c.lineTo(p.x - len * 0.12, p.y - len);
-      }
-      c.strokeStyle = `rgba(175,205,232,${(0.07 + band * 0.07) * lv})`;
-      c.lineWidth = 0.6 + band * 0.45;
-      c.stroke();
-    }
-    if (this.bolt && this.flash > 0) {
-      c.beginPath();
-      const b = this.bolt;
-      c.moveTo(b[0]!, b[1]!);
-      for (let i = 2; i < b.length; i += 2) c.lineTo(b[i]!, b[i + 1]!);
-      c.strokeStyle = `rgba(200,225,255,${0.25 * this.flash * lv})`;
-      c.lineWidth = 9;
-      c.stroke();
-      c.strokeStyle = `rgba(245,250,255,${0.95 * this.flash * lv})`;
-      c.lineWidth = 1.6;
-      c.stroke();
-    }
-  }
-
-  private frontRain(c: CanvasRenderingContext2D, page: HTMLCanvasElement, lv: number): void {
-    const { w, h } = this;
-    // A small copy of the page for the beads to see through. Each bead is
-    // a lens: it shows a wider patch of the page behind it, upside down.
-    const lw = Math.max(1, Math.round(w / 3));
-    const lh = Math.max(1, Math.round(h / 3));
-    if (!this.lens || this.lens.width !== lw || this.lens.height !== lh) {
-      this.lens = document.createElement("canvas");
-      this.lens.width = lw;
-      this.lens.height = lh;
-    }
-    this.lens.getContext("2d")!.drawImage(page, 0, 0, page.width, page.height, 0, 0, lw, lh);
-    this.bead ??= beadSprite();
-    c.globalAlpha = lv;
-    for (const b of this.beads) {
-      const r = b.z;
-      if (b.vy > 0 && b.l) {
-        // A short wet trail, fading upward.
-        const top = Math.max(b.l, b.y - 110);
-        const g = c.createLinearGradient(0, top, 0, b.y);
-        g.addColorStop(0, "rgba(190,220,245,0)");
-        g.addColorStop(1, "rgba(190,220,245,0.22)");
-        c.strokeStyle = g;
-        c.lineWidth = r * 0.5;
-        c.lineCap = "round";
-        c.beginPath();
-        c.moveTo(b.x, top);
-        c.lineTo(b.x, b.y - r * 0.6);
-        c.stroke();
-      }
-      if (r > 3.2) {
-        c.save();
-        c.beginPath();
-        c.ellipse(b.x, b.y, r, r * (b.vy > 0 ? 1.18 : 1), 0, 0, Math.PI * 2);
-        c.clip();
-        c.translate(b.x, b.y);
-        c.scale(1, -1);
-        const span = r * 3.2;
-        c.drawImage(this.lens, (b.x - span) / 3, (b.y - span) / 3, (span * 2) / 3, (span * 2) / 3, -r, -r, r * 2, r * 2);
-        c.restore();
-      }
-      c.drawImage(this.bead, b.x - r, b.y - r, r * 2, r * 2);
-    }
-    // Splashes where keys land.
-    c.fillStyle = "rgba(200,228,250,0.8)";
-    for (const p of this.splashes) {
-      c.globalAlpha = lv * (1 - p.a / p.l);
-      c.beginPath();
-      c.arc(p.x, p.y, 1.4, 0, Math.PI * 2);
-      c.fill();
-    }
-    if (this.flash > 0) {
-      c.globalAlpha = this.flash * 0.22 * lv;
-      c.fillStyle = "#dbe9ff";
-      c.fillRect(0, 0, w, h);
-    }
-    c.globalAlpha = 1;
   }
 
   private frontWind(c: CanvasRenderingContext2D, lv: number): void {
@@ -728,86 +589,6 @@ export class Worlds {
       c.restore();
     }
     c.globalAlpha = 1;
-  }
-
-  private backNight(c: CanvasRenderingContext2D, lv: number): void {
-    const { w, h } = this;
-    // Stars snap to a two-pixel grid and twinkle in steps, like a display.
-    for (const st of this.stars) {
-      const tw = Math.floor((0.5 + 0.5 * Math.sin(this.t * (1 + st.z * 2) + st.s)) * 4) / 4;
-      const a = (0.25 + st.z * 0.75) * (0.45 + tw * 0.55) * lv;
-      const size = st.z > 0.93 ? 3 : st.z > 0.6 ? 2 : 1;
-      c.globalAlpha = a;
-      c.fillStyle = st.z > 0.85 ? "#E8FFF3" : "#9CF0C4";
-      c.fillRect(Math.round((st.x * w) / 2) * 2, Math.round((st.y * h) / 2) * 2, size, size);
-    }
-    // One constellation, drawn on like a plotter, with its catalog mark.
-    const picks = [11, 37, 52, 74, 90, 103, 128];
-    const pts = picks.map((i) => this.stars[i]!).map((s) => [Math.round((s.x * w * 0.5 + w * 0.08) / 2) * 2, Math.round((s.y * h * 0.4 + h * 0.06) / 2) * 2] as const);
-    const drawn = Math.min(pts.length - 1, (this.t * 0.6) % (pts.length + 2));
-    c.globalAlpha = 0.45 * lv;
-    c.strokeStyle = "#9CF0C4";
-    c.lineWidth = 1;
-    c.beginPath();
-    for (let i = 0; i < pts.length - 1 && i < drawn; i++) {
-      const f = Math.min(1, drawn - i);
-      const [x0, y0] = pts[i]!;
-      const [x1, y1] = pts[i + 1]!;
-      c.moveTo(x0, y0);
-      c.lineTo(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f);
-    }
-    c.stroke();
-    c.globalAlpha = 0.8 * lv;
-    for (const [x, y] of pts) {
-      c.fillRect(x - 4, y, 3, 1);
-      c.fillRect(x + 2, y, 3, 1);
-      c.fillRect(x, y - 4, 1, 3);
-      c.fillRect(x, y + 2, 1, 3);
-    }
-    this.moon ??= moonSprite();
-    c.imageSmoothingEnabled = false;
-    c.globalAlpha = lv;
-    const ms = Math.max(2, Math.round((Math.min(w, h) * 0.13) / 40));
-    c.drawImage(this.moon, Math.round(w * 0.8 - 20 * ms), Math.round(h * 0.2 - 20 * ms), 40 * ms, 40 * ms);
-    c.imageSmoothingEnabled = true;
-    if (this.shooting) {
-      const p = this.shooting;
-      const k = p.a / p.l;
-      const x = p.x + p.vx * p.a;
-      const y = p.y + p.vy * p.a;
-      for (let i = 0; i < 14; i++) {
-        c.globalAlpha = lv * (1 - k) * (1 - i / 14);
-        c.fillRect(Math.round((x - p.vx * i * 0.012) / 2) * 2, Math.round((y - p.vy * i * 0.012) / 2) * 2, 2, 2);
-      }
-    }
-    c.globalAlpha = 1;
-  }
-
-  private frontNight(c: CanvasRenderingContext2D, lv: number): void {
-    const { w, h } = this;
-    c.fillStyle = "#E8FFF3";
-    for (const p of this.sparks) {
-      c.globalAlpha = lv * (1 - p.a / p.l);
-      c.fillRect(Math.round(p.x / 2) * 2, Math.round(p.y / 2) * 2, 2, 2);
-    }
-    if (!this.scan) {
-      const sc = sprite(3, (x) => {
-        x.fillStyle = "rgba(0,0,0,0.55)";
-        x.fillRect(0, 2, 3, 1);
-      });
-      this.scan = c.createPattern(sc, "repeat");
-    }
-    if (this.scan) {
-      c.globalAlpha = 0.5 * lv;
-      c.fillStyle = this.scan;
-      c.fillRect(0, 0, w, h);
-    }
-    const v = c.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.hypot(w, h) * 0.62);
-    v.addColorStop(0, "rgba(0,0,0,0)");
-    v.addColorStop(1, `rgba(0,0,0,${0.55 * lv})`);
-    c.globalAlpha = 1;
-    c.fillStyle = v;
-    c.fillRect(0, 0, w, h);
   }
 
   private backSnow(c: CanvasRenderingContext2D, lv: number): void {
@@ -998,6 +779,342 @@ export class Worlds {
       c.quadraticCurveTo(gx + 3, gy - 2, gx + 8, gy - flap);
     }
     c.stroke();
+    c.globalAlpha = 1;
+  }
+
+  /** What a fresh glyph shows. In the matrix, letters decode out of noise. */
+  glyph(ch: string, age: number): string {
+    if (this.id !== "matrix" || ch === " " || age > 240) return ch;
+    return KANA[(Math.floor(age / 45) * 7 + ch.charCodeAt(0) * 13) % KANA.length]!;
+  }
+
+  /** Light the ink gives off in this world, if any: phosphor. */
+  glow(): { color: string; blur: number } | null {
+    if (this.id === "matrix") return { color: "rgba(61,255,119,0.85)", blur: 12 };
+    if (this.id === "terminal") return { color: "rgba(255,160,40,0.8)", blur: 9 };
+    return null;
+  }
+
+  // ------------------------------------------------------- rain (lofi)
+
+  private stepRain(s: number): void {
+    const { w, h } = this;
+    if (!this.bokeh.length) {
+      const r = rng(11);
+      for (let i = 0; i < 30; i++) {
+        const b = part(r() * w, h * (0.2 + r() * 0.8), (r() - 0.5) * 5, 0, r());
+        b.s = r() * 1000;
+        this.bokeh.push(b);
+      }
+    }
+    const want = Math.round((70 + 170 * this.energy + 200 * Math.max(0, this.intensity - 0.62)) * this.lv.rain);
+    while (this.drops.length < want) this.drops.push(part(R() * w * 1.25 - w * 0.25, -R() * h, 0, 0, R()));
+    if (this.drops.length > want) this.drops.length = want;
+    const fall = 0.75 + this.energy * 0.6;
+    for (const d of this.drops) {
+      const v = (700 + 900 * d.z) * fall;
+      d.y += v * s;
+      d.x += v * 0.18 * s;
+      if (d.y > h + 60) {
+        d.y = -40 - R() * 120;
+        d.x = R() * w * 1.25 - w * 0.25;
+      }
+    }
+    for (const b of this.bokeh) {
+      b.a += s;
+      b.x += b.vx * s;
+      if (b.x < -80) b.x = w + 80;
+      if (b.x > w + 80) b.x = -80;
+    }
+    if (this.intensity > 0.85 && R() < s * 0.06) this.flash = 1;
+    this.flash *= Math.exp(-s * 7);
+  }
+
+  private backRain(c: CanvasRenderingContext2D, lv: number): void {
+    const { w, h } = this;
+    // Haze over the city, deepening toward the street.
+    const g = c.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, "rgba(20,18,46,0)");
+    g.addColorStop(1, `rgba(96,62,128,${0.5 * lv})`);
+    c.fillStyle = g;
+    c.fillRect(0, 0, w, h);
+    // City lights, out of focus behind the glass.
+    this.bokehSprites ??= ["255,158,107", "255,210,122", "255,111,163", "111,211,255", "182,156,255"].map(glow);
+    c.globalCompositeOperation = "lighter";
+    for (const b of this.bokeh) {
+      const r = 16 + b.z * 64;
+      const tw = 0.7 + 0.3 * Math.sin(this.t * 0.9 + b.s);
+      c.globalAlpha = lv * (0.1 + 0.16 * (1 - b.z)) * tw;
+      c.drawImage(this.bokehSprites[Math.floor(b.s) % 5]!, b.x - r, b.y - r, r * 2, r * 2);
+    }
+    c.globalCompositeOperation = "source-over";
+    // Far rain: fine and faint.
+    c.strokeStyle = "rgb(190,196,255)";
+    c.lineWidth = 1;
+    c.globalAlpha = 0.14 * lv;
+    c.beginPath();
+    for (const d of this.drops) {
+      if (d.z >= 0.45) continue;
+      const len = 10 + d.z * 26;
+      c.moveTo(d.x, d.y);
+      c.lineTo(d.x - len * 0.18, d.y - len);
+    }
+    c.stroke();
+    c.globalAlpha = 1;
+  }
+
+  private frontRain(c: CanvasRenderingContext2D, lv: number): void {
+    const { w, h } = this;
+    c.strokeStyle = "rgb(214,220,255)";
+    c.lineCap = "round";
+    c.lineWidth = 1.3;
+    c.globalAlpha = 0.3 * lv;
+    c.beginPath();
+    for (const d of this.drops) {
+      if (d.z < 0.45) continue;
+      const len = 26 + d.z * 46;
+      c.moveTo(d.x, d.y);
+      c.lineTo(d.x - len * 0.18, d.y - len);
+    }
+    c.stroke();
+    // Mist off the street.
+    const g = c.createLinearGradient(0, h * 0.72, 0, h);
+    g.addColorStop(0, "rgba(170,150,230,0)");
+    g.addColorStop(1, `rgba(170,150,230,${0.16 * lv})`);
+    c.globalAlpha = 1;
+    c.fillStyle = g;
+    c.fillRect(0, h * 0.72, w, h * 0.28);
+    if (this.flash > 0.02) {
+      c.globalAlpha = this.flash * 0.3 * lv;
+      c.fillStyle = "#E8E6FF";
+      c.fillRect(0, 0, w, h);
+    }
+    c.globalAlpha = 1;
+  }
+
+  // ------------------------------------------------------------ matrix
+
+  private stepMatrix(s: number): void {
+    const { w, h } = this;
+    const d = Math.min(2, window.devicePixelRatio || 1);
+    let warm = 0;
+    if (!this.code || this.code.width !== Math.round(w * d) || this.code.height !== Math.round(h * d)) {
+      this.code = document.createElement("canvas");
+      this.code.width = Math.round(w * d);
+      this.code.height = Math.round(h * d);
+      this.cols = Array.from({ length: Math.ceil(w / CELL) }, () => ({ y: R() * h, v: 7 + R() * 16, cell: -1 }));
+      warm = 90;
+    }
+    const x = this.code.getContext("2d")!;
+    x.setTransform(d, 0, 0, d, 0, 0);
+    x.font = `500 ${CELL - 4}px ${MONO}`;
+    x.textAlign = "center";
+    x.textBaseline = "middle";
+    const step = (dt: number) => {
+      // Old code fades where it fell.
+      x.globalCompositeOperation = "destination-out";
+      x.fillStyle = `rgba(0,0,0,${1 - Math.exp(-dt * 1.5)})`;
+      x.fillRect(0, 0, w, h);
+      x.globalCompositeOperation = "source-over";
+      const pace = 0.7 + this.energy * 0.8;
+      this.cols.forEach((col, i) => {
+        col.y += col.v * CELL * dt * pace;
+        const cell = Math.floor(col.y / CELL);
+        if (cell !== col.cell) {
+          col.cell = cell;
+          x.fillStyle = R() < 0.1 ? "#B8FFC9" : "#22D35A";
+          x.fillText(KANA[Math.floor(R() * KANA.length)]!, i * CELL + CELL / 2, cell * CELL + CELL / 2);
+        }
+        if (col.y > h + R() * h * 0.6) {
+          col.y = -R() * h * 0.4;
+          col.v = 7 + R() * 16;
+        }
+      });
+    };
+    for (let i = 0; i < warm; i++) step(1 / 30);
+    if (s > 0) step(s);
+  }
+
+  private backMatrix(c: CanvasRenderingContext2D, lv: number): void {
+    if (!this.code) return;
+    const { w, h } = this;
+    c.globalAlpha = lv * 0.5;
+    c.drawImage(this.code, 0, 0, w, h);
+    // The leading glyph of every stream burns white.
+    c.globalAlpha = lv * 0.85;
+    c.fillStyle = "#E6FFEC";
+    c.font = `600 ${CELL - 4}px ${MONO}`;
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    const flick = Math.floor(this.t * 14);
+    this.cols.forEach((col, i) => {
+      if (col.cell < 0 || col.cell * CELL > h) return;
+      c.fillText(KANA[(i * 7 + col.cell * 13 + flick) % KANA.length]!, i * CELL + CELL / 2, col.cell * CELL + CELL / 2);
+    });
+    c.textAlign = "left";
+    c.textBaseline = "alphabetic";
+    c.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------- terminal
+
+  private frontTerminal(c: CanvasRenderingContext2D, lv: number): void {
+    const { w, h } = this;
+    if (!this.scan) {
+      const sc = document.createElement("canvas");
+      sc.width = 1;
+      sc.height = 3;
+      const x = sc.getContext("2d")!;
+      x.fillStyle = "rgba(0,0,0,0.55)";
+      x.fillRect(0, 2, 1, 1);
+      this.scan = c.createPattern(sc, "repeat");
+    }
+    // Scanlines.
+    c.globalAlpha = lv * 0.45;
+    c.fillStyle = this.scan!;
+    c.fillRect(0, 0, w, h);
+    // The refresh rolling down the tube.
+    const y = ((this.t * 0.14) % 1) * h * 1.4 - h * 0.2;
+    const band = c.createLinearGradient(0, y - h * 0.1, 0, y);
+    band.addColorStop(0, "rgba(255,185,64,0)");
+    band.addColorStop(1, "rgba(255,185,64,0.07)");
+    c.globalAlpha = lv;
+    c.fillStyle = band;
+    c.fillRect(0, y - h * 0.1, w, h * 0.1);
+    // The tube: dark corners, a rounded glass edge in a black bezel.
+    const R0 = Math.hypot(w, h) / 2;
+    const v = c.createRadialGradient(w / 2, h / 2, R0 * 0.55, w / 2, h / 2, R0);
+    v.addColorStop(0, "rgba(0,0,0,0)");
+    v.addColorStop(1, "rgba(0,0,0,0.75)");
+    c.fillStyle = v;
+    c.fillRect(0, 0, w, h);
+    c.fillStyle = "#050403";
+    c.beginPath();
+    c.rect(0, 0, w, h);
+    c.roundRect(10, 10, w - 20, h - 20, Math.min(w, h) * 0.045);
+    c.fill("evenodd");
+    // It boots when you open it.
+    const lines = ["type/os 0.9 . phosphor", "mounting /dev/thoughts ...... ok", "warming the tube ............ ok", "ready."];
+    let left = this.boot * 60;
+    const fade = Math.min(1, Math.max(0, (9 - this.boot) / 2));
+    if (fade > 0 && left > 0) {
+      c.font = `500 12px ${MONO}`;
+      c.fillStyle = "#FFB940";
+      c.globalAlpha = lv * 0.75 * fade;
+      lines.forEach((ln, i) => {
+        if (left <= 0) return;
+        c.fillText(ln.slice(0, Math.floor(left)), 30, h - 36 - (lines.length - 1 - i) * 17);
+        left -= ln.length + 6;
+      });
+    }
+    c.globalAlpha = 1;
+  }
+
+  // ------------------------------------------------------------ sakura
+
+  private stepSakura(s: number): void {
+    const { w, h } = this;
+    const want = Math.round((26 + 70 * this.energy + 60 * Math.max(0, this.intensity - 0.62)) * this.lv.sakura);
+    let base = this.petals.filter((p) => p.l === 0).length;
+    while (base < want) {
+      this.petals.push(petal(R() * w * 1.3 - w * 0.3, -20 - R() * h * 0.5));
+      base++;
+    }
+    const wind = 30 + 150 * this.energy;
+    for (const p of this.petals) {
+      p.a += s;
+      const gust = wind * (0.6 + 0.4 * Math.sin(this.t * 0.5 + p.s));
+      p.vx += (gust - p.vx) * Math.min(1, s * 0.8);
+      p.x += (p.vx * (0.5 + p.z * 0.5) + Math.sin(p.a * 1.7 + p.s) * 24) * s;
+      p.y += (34 + 46 * p.z) * s;
+      p.rot += p.vr * s;
+      p.spin += p.vs * s;
+      if (!p.l && (p.y > h + 30 || p.x > w + 40)) Object.assign(p, petal(R() * w * 1.1 - w * 0.3, -30));
+    }
+    this.petals = this.petals.filter((p) => !p.l || p.a < p.l);
+    for (const sp of this.sparkles) sp.a += s;
+    this.sparkles = this.sparkles.filter((sp) => sp.a < sp.l);
+  }
+
+  private backSakura(c: CanvasRenderingContext2D, lv: number): void {
+    const { w, h } = this;
+    // Spring light pouring in from the top right corner.
+    const sun = c.createRadialGradient(w * 0.92, -h * 0.05, 0, w * 0.92, -h * 0.05, Math.max(w, h) * 0.75);
+    sun.addColorStop(0, `rgba(255,255,255,${0.9 * lv})`);
+    sun.addColorStop(0.4, `rgba(255,226,236,${0.35 * lv})`);
+    sun.addColorStop(1, "rgba(255,226,236,0)");
+    c.fillStyle = sun;
+    c.fillRect(0, 0, w, h);
+    const breathe = 0.75 + 0.25 * Math.sin(this.t * 0.4);
+    for (let i = 0; i < 5; i++) {
+      const a = 2.2 + i * 0.13;
+      const len = Math.hypot(w, h) * 1.2;
+      const spread = 0.025 + 0.012 * (i % 2);
+      c.globalAlpha = lv * 0.14 * breathe * (i % 2 ? 0.7 : 1);
+      const ray = c.createLinearGradient(w * 0.92, 0, w * 0.92 + Math.cos(a) * len, Math.sin(a) * len);
+      ray.addColorStop(0, "rgba(255,255,255,1)");
+      ray.addColorStop(1, "rgba(255,255,255,0)");
+      c.fillStyle = ray;
+      c.beginPath();
+      c.moveTo(w * 0.92, -h * 0.05);
+      c.lineTo(w * 0.92 + Math.cos(a - spread) * len, Math.sin(a - spread) * len);
+      c.lineTo(w * 0.92 + Math.cos(a + spread) * len, Math.sin(a + spread) * len);
+      c.closePath();
+      c.fill();
+    }
+    c.globalAlpha = 1;
+    this.drawPetals(c, lv, false);
+  }
+
+  private frontSakura(c: CanvasRenderingContext2D, lv: number): void {
+    this.drawPetals(c, lv, true);
+    // Kira kira: sparkles where the keys land.
+    this.ember ??= glow("255,150,190");
+    for (const sp of this.sparkles) {
+      const k = sp.a / sp.l;
+      const sc = Math.sin(k * Math.PI);
+      const r = sp.z * sc;
+      c.save();
+      c.translate(sp.x, sp.y + sp.vy * sp.a);
+      c.globalAlpha = lv * sc * 0.7;
+      c.drawImage(this.ember, -r * 2.2, -r * 2.2, r * 4.4, r * 4.4);
+      c.rotate(k * 1.2);
+      c.globalAlpha = lv * sc;
+      c.fillStyle = "#FFFFFF";
+      sparklePath(c, r * 1.6);
+      c.fill();
+      c.restore();
+    }
+    c.globalAlpha = 1;
+  }
+
+  private drawPetals(c: CanvasRenderingContext2D, lv: number, near: boolean): void {
+    this.petalSprites ??= [
+      petalSprite("#F48FB1", "#FFE4EC"),
+      petalSprite("#F7A1C0", "#FFF1F5"),
+      petalSprite("#EE7FA6", "#FFD9E6")
+    ];
+    const m = c.getTransform();
+    for (const p of this.petals) {
+      if (p.z >= 0.35 !== near) continue;
+      const size = 5 + p.z * 12;
+      // Fluttering: the petal turns edge-on and back as it falls.
+      const flip = Math.cos(p.spin);
+      const sx = Math.sign(flip || 1) * Math.max(0.18, Math.abs(flip));
+      const cos = Math.cos(p.rot);
+      const sin = Math.sin(p.rot);
+      c.setTransform(
+        m.a * cos * sx,
+        m.a * sin * sx,
+        -m.a * sin,
+        m.a * cos,
+        m.a * p.x + m.e,
+        m.d * p.y + m.f
+      );
+      c.globalAlpha = lv * (near ? 0.95 : 0.55);
+      c.drawImage(this.petalSprites[p.k]!, -size, -size, size * 2, size * 2);
+    }
+    c.setTransform(m);
     c.globalAlpha = 1;
   }
 

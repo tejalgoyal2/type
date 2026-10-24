@@ -1763,6 +1763,11 @@ export class Engine {
     s.textBaseline = "alphabetic";
     const n = this.lines.length;
     const { clearTop, fadeTop } = this.historyFade();
+    const wg = this.worlds.glow();
+    if (wg) {
+      s.shadowColor = wg.color;
+      s.shadowBlur = wg.blur * 0.7 * this.dpr;
+    }
     for (let row = 1; row <= n; row++) {
       const y = this.typingY - this.lineHeight * row;
       if (y < clearTop) break;
@@ -1776,6 +1781,8 @@ export class Engine {
       });
     }
     s.globalAlpha = 1;
+    s.shadowBlur = 0;
+    s.shadowColor = "rgba(0,0,0,0)";
     // Dissolve the top of the history into the paper.
     s.globalCompositeOperation = "destination-out";
     const grad = s.createLinearGradient(0, clearTop, 0, fadeTop);
@@ -1876,9 +1883,16 @@ export class Engine {
   ): void {
     const ctx = this.ctx;
     ctx.textBaseline = "alphabetic";
+    // Some worlds make the ink itself give off light.
+    const wg = this.worlds.glow();
     for (let i = 0; i < this.active.length; i++) {
       const g = this.active[i]!;
       const age = now - g.born;
+      const shown = this.worlds.glyph(g.ch, age);
+      if (wg) {
+        ctx.shadowColor = wg.color;
+        ctx.shadowBlur = wg.blur * this.dpr;
+      }
       const land = mm > 0 ? landCurve(age / LAND_MS) : 1;
       const settling = land < 0.999 || age < 600;
       const alpha = Math.min(1, age / 45) * this.inkAlpha;
@@ -1936,9 +1950,9 @@ export class Engine {
         if (mis > 0.35) {
           ctx.globalAlpha = alpha * 0.55;
           ctx.fillStyle = fx.misAS;
-          ctx.fillText(g.ch, x - mis, y + mis * 0.4);
+          ctx.fillText(shown, x - mis, y + mis * 0.4);
           ctx.fillStyle = fx.misBS;
-          ctx.fillText(g.ch, x + mis, y - mis * 0.3);
+          ctx.fillText(shown, x + mis, y - mis * 0.3);
         }
       }
 
@@ -1964,21 +1978,21 @@ export class Engine {
         ctx.save();
         ctx.translate(x + xOff + this.advance / 2, y - this.fs * 0.33);
         ctx.scale(stampScale, stampScale);
-        ctx.fillText(g.ch, -this.advance / 2, this.fs * 0.33);
+        ctx.fillText(shown, -this.advance / 2, this.fs * 0.33);
         ctx.restore();
       } else if (sd.land === "crystal" && settling && mm > 0) {
         const sc = 1 + (1 - land) * 0.22 * mm;
         ctx.save();
         ctx.translate(x + xOff + this.advance / 2, y - this.fs * 0.33);
         ctx.scale(sc, sc);
-        ctx.fillText(g.ch, -this.advance / 2, this.fs * 0.33);
+        ctx.fillText(shown, -this.advance / 2, this.fs * 0.33);
         ctx.restore();
       } else if (sd.land === "blow" && settling && mm > 0) {
         const shear = (1 - land) * 0.32 * mm;
         ctx.save();
         ctx.translate(x + xOff, y);
         ctx.transform(1, 0, -shear, 1, 0, 0);
-        ctx.fillText(g.ch, 0, 0);
+        ctx.fillText(shown, 0, 0);
         ctx.restore();
       } else if (settling && mm > 0) {
         // Universal landing pop: every fresh letter springs in a touch.
@@ -1986,13 +2000,15 @@ export class Engine {
         ctx.save();
         ctx.translate(x + xOff + this.advance / 2, y - this.fs * 0.33);
         ctx.scale(pop, pop);
-        ctx.fillText(g.ch, -this.advance / 2, this.fs * 0.33);
+        ctx.fillText(shown, -this.advance / 2, this.fs * 0.33);
         ctx.restore();
       } else {
-        ctx.fillText(g.ch, x + xOff, y);
+        ctx.fillText(shown, x + xOff, y);
       }
       if (glowing) ctx.shadowBlur = 0;
     }
+    ctx.shadowBlur = 0;
+    ctx.shadowColor = "rgba(0,0,0,0)";
     ctx.globalAlpha = 1;
   }
 

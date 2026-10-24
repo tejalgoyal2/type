@@ -169,3 +169,19 @@ test("with motion off the camera never moves", async ({ page }) => {
   expect(p.cine.focus).toBe(0);
   expect(p.cine.zoom).toBe(1);
 });
+
+test("matrix, terminal and sakura each take over the page", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await open(page, { prefs: { motion: 2 } });
+  for (const [line, id] of [
+    ["follow the white rabbit into the matrix ", "matrix"],
+    ["then open a terminal ", "terminal"],
+    ["and walk under the sakura ", "sakura"]
+  ] as const) {
+    await page.keyboard.type(line, { delay: 20 });
+    expect((await probe(page)).world).toBe(id);
+    await page.waitForTimeout(600);
+  }
+  expect(errors).toEqual([]);
+});
